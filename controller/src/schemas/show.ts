@@ -44,6 +44,8 @@ export const SHOW_SEGMENT_SKILL_MAX = 64;
 export const SHOW_THEME_ID_MAX = 64;
 export const SHOW_YEAR_MIN = 1900;
 export const SHOW_YEAR_MAX = 2100;
+export const SHOW_RELEASE_MONTHS_MIN = 1;
+export const SHOW_RELEASE_MONTHS_MAX = 60;
 // Also the STATION-wide cap's ceiling — settings/defaults.ts BOUNDS reads it
 // from here, because the strict show validator has always bounds-checked a
 // show's override against the station figure and two copies would drift.
@@ -349,6 +351,14 @@ function showObjectSchema(ctx: ShowSchemaContext) {
       // now spans mood/genre/era/energy, so migrating it would harden filters
       // an old show never opted into.
       filtersStrict: showBool(),
+      releaseDateMonths: z
+        .union([z.null(), z.literal(''), z.number(), z.string()])
+        .optional()
+        .transform((v) => (v == null || v === '' ? null : Number(v)))
+        .refine(
+          (n) => n == null || (Number.isInteger(n) && n >= SHOW_RELEASE_MONTHS_MIN && n <= SHOW_RELEASE_MONTHS_MAX),
+          `must be an integer between ${SHOW_RELEASE_MONTHS_MIN} and ${SHOW_RELEASE_MONTHS_MAX}`,
+        ),
       // null = inherit the station default, 0 = unlimited, >0 = this show's cap.
       maxTrackSeconds: z
         .union([z.null(), z.literal(''), z.number(), z.string()])
@@ -508,6 +518,12 @@ export function repairShowForLoad(
       max: SHOW_FILTER_VALUES_MAX,
       values: SHOW_ENERGY,
     }),
+    releaseDateMonths: (() => {
+      const n = raw.releaseDateMonths == null || raw.releaseDateMonths === '' ? null : Number(raw.releaseDateMonths);
+      return n == null || (Number.isInteger(n) && n >= SHOW_RELEASE_MONTHS_MIN && n <= SHOW_RELEASE_MONTHS_MAX)
+        ? n
+        : undefined;
+    })(),
     eras: Array.isArray(raw.eras)
       ? raw.eras
           .map(repairEraWindow)

@@ -101,6 +101,7 @@ export function get(songId: string): any {
     // Era-year surface (issue #842) — show-filter.resolveEraYear precedence:
     // originalYear wins; a compilation's plain year is untrusted.
     originalYear: t.originalYear,
+    releaseDate: t.releaseDate,
     isCompilation: t.isCompilation,
     genres: t.genres,
     genre: t.genre,
@@ -317,6 +318,7 @@ function slimTrack(r: db.TrackRecord) {
     // Era-year surface (issue #842) — carried inline so show-filter's era
     // checks on library-sourced pools never need a per-track DB lookup.
     originalYear: r.originalYear,
+    releaseDate: r.releaseDate,
     isCompilation: r.isCompilation,
     genres: r.genres,
     genre: r.genre,

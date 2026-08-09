@@ -21,6 +21,7 @@ export interface FilterTrack {
   genres?: string[] | null;
   genre?: string | null;
   year?: number | string | null;
+  releaseDate?: string | null;
   // Original-release-year surface (issue #842). Library-sourced tracks carry
   // both; raw Subsonic children carry neither (undefined ≠ "not a comp") and
   // fall back to a library lookup in trackEraYear.
@@ -192,6 +193,7 @@ export function onlyGenre<T extends FilterTrack>(tracks: T[], genreNames?: strin
 // ── Era (decade / year windows) ──────────────────────────────────────────────
 
 export type YearRange = { fromYear?: number | null; toYear?: number | null };
+export type ReleaseDateWindow = { months?: number | null };
 
 // True when the list carries at least one real bound — the "is there an era
 // constraint at all?" test shared by the pick paths.
@@ -283,6 +285,81 @@ export function inYearRange<T extends FilterTrack>(tracks: T[], eras: YearRange[
 export function preferEra<T extends FilterTrack>(tracks: T[], eras?: YearRange[] | null): T[] {
   if (!hasEraBound(eras)) return tracks;
   const match = inYearRange(tracks, eras!);
+  return match.length ? match : tracks;
+}
+
+// ── Rolling album release date windows ─────────────────────────────────────
+
+export function hasReleaseDateBound(windows?: ReleaseDateWindow[] | null): boolean {
+  return !!windows?.some(w => Number.isInteger(w?.months) && Number(w.months) > 0);
+}
+
+function parseIsoDateMs(s: unknown): number | null {
+  if (typeof s !== 'string') return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d
+    ? dt.getTime()
+    : null;
+}
+
+function daysInUtcMonth(year: number, monthIndex: number): number {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+export function subtractUtcMonthsClamped(now: Date, months: number): Date {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  const target = new Date(Date.UTC(y, m - months, 1));
+  const day = Math.min(d, daysInUtcMonth(target.getUTCFullYear(), target.getUTCMonth()));
+  return new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), day));
+}
+
+export function releaseDateCutoff(windows?: ReleaseDateWindow[] | null, now: Date = new Date()): number | null {
+  const months = (windows ?? [])
+    .map(w => Number(w?.months))
+    .filter(n => Number.isInteger(n) && n > 0);
+  if (!months.length) return null;
+  // OR semantics across rolling windows collapses to the widest window.
+  return subtractUtcMonthsClamped(now, Math.max(...months)).getTime();
+}
+
+export function trackReleaseDateMs(t: FilterTrack | null | undefined): number | null {
+  const own = parseIsoDateMs(t?.releaseDate);
+  if (own != null) return own;
+  const rec = t?.id ? library.getPlaybackMeta(t.id) : null;
+  return parseIsoDateMs(rec?.releaseDate);
+}
+
+// Hard-filter to albums released within the rolling window. Unknown, partial,
+// invalid, and future dates drop: a New Music show should not silently admit
+// tracks whose album release date cannot prove it belongs.
+export function inReleaseDateRange<T extends FilterTrack>(
+  tracks: T[],
+  windows?: ReleaseDateWindow[] | null,
+  now: Date = new Date(),
+): T[] {
+  const cutoff = releaseDateCutoff(windows, now);
+  if (cutoff == null) return tracks;
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return tracks.filter((t) => {
+    const ms = trackReleaseDateMs(t);
+    return ms != null && ms >= cutoff && ms <= today;
+  });
+}
+
+export function preferReleaseDate<T extends FilterTrack>(
+  tracks: T[],
+  windows?: ReleaseDateWindow[] | null,
+  now: Date = new Date(),
+): T[] {
+  if (!hasReleaseDateBound(windows)) return tracks;
+  const match = inReleaseDateRange(tracks, windows, now);
   return match.length ? match : tracks;
 }
 
@@ -456,6 +533,7 @@ export function onlyVocals<T extends FilterTrack>(tracks: T[], mode?: VocalMode 
 export type StrictLocks = {
   genres?: string[] | null;
   eras?: YearRange[] | null;
+  releaseDateWindows?: ReleaseDateWindow[] | null;
   moods?: string[] | null;
   energies?: string[] | null;
   vocals?: VocalMode | null;
@@ -491,6 +569,7 @@ export function applyStrictLocks<T extends FilterTrack>(
   };
   if (locks.genres?.length) step(onlyGenre(pool, locks.genres));
   if (hasEraBound(locks.eras)) step(inYearRange(pool, locks.eras!));
+  if (hasReleaseDateBound(locks.releaseDateWindows)) step(inReleaseDateRange(pool, locks.releaseDateWindows!));
   if (locks.moods?.length) step(onlyMood(pool, locks.moods));
   if (locks.energies?.length) step(onlyEnergy(pool, locks.energies));
   if (locks.vocals) step(onlyVocals(pool, locks.vocals));

@@ -18,6 +18,7 @@ export function rowToTrack(row: TrackRow): TrackRecord {
     originalYear: row.original_year ?? null,
     originalYearSource: row.original_year_source ?? null,
     originalYearCheckedAt: row.original_year_checked_at ?? null,
+    releaseDate: row.release_date ?? null,
     isCompilation: row.is_compilation == null ? null : !!row.is_compilation,
     genres: row.genres ? safeParseArray(row.genres) : [],
     genre: row.genre,
@@ -189,4 +190,3 @@ export function normaliseYear(y: unknown): number | null {
   }
   return null;
 }
-

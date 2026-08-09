@@ -132,6 +132,7 @@ async function main() {
         artist: song.artist,
         album: song.album,
         year: song.year,
+        releaseDate: song.albumReleaseDate ?? null,
         genres: subsonic.songGenres(song),
         duration: song.duration,
       });

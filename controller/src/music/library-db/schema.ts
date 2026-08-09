@@ -405,6 +405,14 @@ export async function migrate(embeddingDim: number, reseed = false, adoptStoredD
     d.pragma('user_version = 20');
   }
 
+  if (userVersion < 21) {
+    // Full album release date for rolling "new music" show filters. Unlike the
+    // existing era year, this is exact enough for month/day cutoffs; unknown or
+    // partial dates stay NULL and do not satisfy a rolling release window.
+    runDdl(d, `ALTER TABLE tracks ADD COLUMN release_date TEXT;`);
+    d.pragma('user_version = 21');
+  }
+
   // Reconcile the requested embedding dim against what physically exists.
   //
   // The vec0 table's `FLOAT[N]` schema is the authority for what inserts accept —
@@ -520,5 +528,4 @@ function vecTableDim(d: Database.Database): number | null {
 function vecCount(d: Database.Database): number {
   return (d.prepare('SELECT COUNT(*) AS n FROM track_vectors').get() as { n: number }).n;
 }
-
 

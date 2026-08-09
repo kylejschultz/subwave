@@ -51,6 +51,7 @@ const FIELD_LABELS: Record<string, string> = {
   personaId: 'host',
   guestPersonaIds: 'guests',
   maxTrackSeconds: 'track length cap',
+  releaseDateMonths: 'release date window',
   segmentSkill: 'feature skill',
   playlistIds: 'playlists',
   excludedPlaylistIds: 'excluded playlists',
@@ -384,6 +385,27 @@ export function ShowEditor({
           </Field>
 
           <Field>
+            <Label htmlFor="show-release-date-months">album release window</Label>
+            <Input
+              id="show-release-date-months"
+              type="number"
+              min={1}
+              max={60}
+              step={1}
+              value={show.releaseDateMonths ?? ''}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                const value = e.target.value.trim();
+                update({ releaseDateMonths: value === '' ? null : Number(value) });
+              }}
+              placeholder="Any"
+            />
+            <span className="field-hint">
+              Optional. Uses the album release date from Navidrome, not when it
+              was added to the library. Tracks with unknown dates do not qualify.
+            </span>
+          </Field>
+
+          <Field>
             <Label>energy</Label>
             <ChipRow
               options={ENERGY_OPTIONS.map(e => ({ key: e, label: e }))}
@@ -493,9 +515,9 @@ export function ShowEditor({
               </Label>
               <span className="field-hint">
                 Hard-enforces every filter set above (mood, era, energy,
-                genre); off-filter tracks play only as a last resort. When off,
-                they&apos;re soft leans the DJ can break for flow. Needs at
-                least one filter set.
+                genre). The release window is always exact. Off-filter tracks
+                play only as a last resort for soft filters. Needs at least one
+                filter set.
               </span>
             </div>
           </div>
@@ -616,4 +638,3 @@ export function ShowEditor({
     </EditorDialog>
   );
 }
-

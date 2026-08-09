@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   normGenre, genreMatches, genreResolutionWarning, preferGenre,
   hasEraBound, eraSpan, inYearRange, preferEra,
+  hasReleaseDateBound, inReleaseDateRange, preferReleaseDate, subtractUtcMonthsClamped,
   resolveEraYear, trackEraYear,
   preferEnergy, preferEnergyStrict, preferMood,
   onlyGenre, onlyMood, onlyEnergy, applyStrictLocks,
@@ -181,6 +182,37 @@ await test('inYearRange places a compilation track by its ORIGINAL year (#842)',
   assert.deepEqual(inYearRange([compUnresolved], seventies), []);
 });
 
+console.log('release date (rolling album window):');
+await test('hasReleaseDateBound only sees positive integer month windows', () => {
+  assert.equal(hasReleaseDateBound([]), false);
+  assert.equal(hasReleaseDateBound([{ months: null }]), false);
+  assert.equal(hasReleaseDateBound([{ months: 0 }]), false);
+  assert.equal(hasReleaseDateBound([{ months: 3 }]), true);
+});
+await test('subtractUtcMonthsClamped handles short months and leap day boundaries', () => {
+  assert.equal(subtractUtcMonthsClamped(new Date(Date.UTC(2024, 2, 31)), 1).toISOString().slice(0, 10), '2024-02-29');
+  assert.equal(subtractUtcMonthsClamped(new Date(Date.UTC(2025, 2, 31)), 1).toISOString().slice(0, 10), '2025-02-28');
+});
+await test('inReleaseDateRange is exact: unknown, invalid, partial, and future dates drop', () => {
+  const now = new Date(Date.UTC(2026, 7, 8));
+  const fresh = t({ id: 'fresh', releaseDate: '2026-05-08' });
+  const boundary = t({ id: 'boundary', releaseDate: '2026-02-08' });
+  const old = t({ id: 'old', releaseDate: '2026-02-07' });
+  const partial = t({ id: 'partial', releaseDate: '2026' });
+  const invalid = t({ id: 'invalid', releaseDate: '2026-02-31' });
+  const future = t({ id: 'future', releaseDate: '2026-08-09' });
+  assert.deepEqual(
+    inReleaseDateRange([fresh, boundary, old, partial, invalid, future], [{ months: 6 }], now).map(x => x.id),
+    ['fresh', 'boundary'],
+  );
+});
+await test('preferReleaseDate never-starves per source; hard filter can empty', () => {
+  const now = new Date(Date.UTC(2026, 7, 8));
+  const old = t({ releaseDate: '2025-01-01' });
+  assert.deepEqual(preferReleaseDate([old], [{ months: 3 }], now), [old]);
+  assert.deepEqual(inReleaseDateRange([old], [{ months: 3 }], now), []);
+});
+
 console.log('energy (any-of bands):');
 await test('preferEnergy: unknown-energy tracks stay eligible; any band matches', () => {
   const hi = t({ energy: 'high' });
@@ -254,13 +286,22 @@ await test('inYearRange: null/empty-string year does NOT pass an open-lower-boun
 
 console.log('applyStrictLocks (per-dimension cascade — the shared strict enforcer):');
 await test('starve:true drops every dimension hard, even to empty (agent-tool contract)', () => {
-  const jazz80sCalm = t({ id: '1', genre: 'Jazz', year: 1985, moods: ['calm'], audioMoods: [], energy: 'low' });
-  const rock = t({ id: '2', genre: 'Rock', year: 1985, moods: ['calm'], audioMoods: [], energy: 'low' });
-  const locks = { genres: ['Jazz'], eras: [{ fromYear: 1980, toYear: 1989 }], moods: ['calm'], energies: ['low'] };
+  const jazz80sCalm = t({ id: '1', genre: 'Jazz', year: 1985, releaseDate: new Date().toISOString().slice(0, 10), moods: ['calm'], audioMoods: [], energy: 'low' });
+  const rock = t({ id: '2', genre: 'Rock', year: 1985, releaseDate: new Date().toISOString().slice(0, 10), moods: ['calm'], audioMoods: [], energy: 'low' });
+  const locks = { genres: ['Jazz'], eras: [{ fromYear: 1980, toYear: 1989 }], releaseDateWindows: [{ months: 1 }], moods: ['calm'], energies: ['low'] };
   assert.deepEqual(applyStrictLocks([jazz80sCalm, rock], locks, { starve: true }).map(x => x.id), ['1']);
   // Un-tagged pool + a mood lock → hard-empties (the wider scope guards dead air).
-  const untagged = t({ id: '3', genre: 'Jazz', year: 1985, moods: [], audioMoods: [], energy: 'low' });
+  const untagged = t({ id: '3', genre: 'Jazz', year: 1985, releaseDate: new Date().toISOString().slice(0, 10), moods: [], audioMoods: [], energy: 'low' });
   assert.deepEqual(applyStrictLocks([untagged], locks, { starve: true }), []);
+});
+await test('applyStrictLocks release-date lock drops old and unknown dates', () => {
+  const fresh = t({ id: 'fresh', releaseDate: new Date().toISOString().slice(0, 10) });
+  const old = t({ id: 'old', releaseDate: '2000-01-01' });
+  const unknown = t({ id: 'unknown' });
+  assert.deepEqual(
+    applyStrictLocks([fresh, old, unknown], { releaseDateWindows: [{ months: 1 }] }, { starve: true }).map(x => x.id),
+    ['fresh'],
+  );
 });
 await test('starve:false never-starves PER DIMENSION: one zero-coverage class keeps the rest pure', () => {
   // Genre + era have matches; NO track carries a mood (un-tagged library). The

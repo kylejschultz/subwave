@@ -13,7 +13,7 @@ import * as subsonic from '../music/subsonic.js';
 import * as dj from '../llm/dj.js';
 import * as library from '../music/library.js';
 import * as settings from '../settings.js';
-import { normGenre, genreMatches, genreResolutionWarningOnce, inYearRange, preferEnergy, preferEnergyStrict, preferMood, applyStrictLocks, hasEraBound, eraSpan, type VocalMode } from '../music/show-filter.js';
+import { normGenre, genreMatches, genreResolutionWarningOnce, inYearRange, preferEnergy, preferEnergyStrict, preferMood, applyStrictLocks, hasEraBound, hasReleaseDateBound, eraSpan, inReleaseDateRange, preferReleaseDate, type ReleaseDateWindow, type VocalMode } from '../music/show-filter.js';
 import { freshnessBiasedOrder } from '../music/airing.js';
 import { recencyWindowsForLibrary } from '../music/recency.js';
 import { resolveShowPlaylistPool, resolveExcludedPlaylistIds } from '../music/show-playlist.js';
@@ -113,12 +113,14 @@ async function refreshAutoPlaylistInner() {
   // Multi-value lists (#929): OR within an attribute, AND across attributes.
   const showGenres: string[] = show?.genres ?? [];
   const eras = (show?.eras ?? []) as { fromYear: number | null; toYear: number | null }[];
+  const releaseDateWindows: ReleaseDateWindow[] = show?.releaseDateMonths ? [{ months: show.releaseDateMonths }] : [];
+  const hasReleaseDate = hasReleaseDateBound(releaseDateWindows);
   const showEnergies: string[] = show?.energies ?? [];
   // A genre or a year window narrows the pool; energy or vocals alone only
   // soft-leans (mirrors picker.hasMusicFilter). Strict (show.filtersStrict) opts
   // EVERY set filter — mood, genre, era, energy, vocals — into a hard filter on
   // the pool.
-  const narrow = !!(show && (showGenres.length || hasEraBound(eras)));
+  const narrow = !!(show && (showGenres.length || hasEraBound(eras) || hasReleaseDate));
   const showMoods: string[] = show?.moods ?? [];
   const showVocals = (show?.vocals ?? '') as VocalMode;
   const strict = !!(show?.filtersStrict && (showGenres.length || showMoods.length || showEnergies.length || showVocals || hasEraBound(eras)));
@@ -167,6 +169,7 @@ async function refreshAutoPlaylistInner() {
     let out = items;
     if (strictGenreNorms.length) out = out.filter((t: any) => genreMatches(t, strictGenreNorms));
     if (strict && hasEraBound(eras)) out = inYearRange(out, eras);
+    out = preferReleaseDate(out, releaseDateWindows);
     if (strict && showMoods.length) out = preferMood(out, showMoods);
     if (strict && showEnergies.length) out = preferEnergyStrict(out, showEnergies);
     return out;
@@ -208,6 +211,9 @@ async function refreshAutoPlaylistInner() {
       // envelope (eraSpan); the genre-tagged sets post-filter to the exact
       // window union (inYearRange).
       const span = eraSpan(eras);
+      const releaseSpan = hasReleaseDate ? { fromYear: new Date().getUTCFullYear() - Math.ceil(Number(show.releaseDateMonths) / 12) - 1, toYear: new Date().getUTCFullYear() } : null;
+      const fromYear = span.fromYear ?? releaseSpan?.fromYear;
+      const toYear = span.toYear ?? releaseSpan?.toYear;
       const randomSize = strict ? 60 : 40;
       const genreSetSize = strict ? 100 : 60;
       // Two fetches per genre, fanned out with bounded concurrency rather than
@@ -221,8 +227,8 @@ async function refreshAutoPlaylistInner() {
         got.push(...await subsonic.getRandomSongs({
           size: Math.ceil(randomSize / Math.max(1, genreNames.length)),
           genre: genreName,
-          fromYear: span.fromYear ?? undefined,
-          toYear: span.toYear ?? undefined,
+          fromYear: fromYear ?? undefined,
+          toYear: toYear ?? undefined,
         }));
         if (genreName) {
           // Sampled: a random page of the genre rather than the same
@@ -236,7 +242,8 @@ async function refreshAutoPlaylistInner() {
       const collected: any[] = perGenre.flat();
       // The random fetch used the coarse era envelope — tighten to the exact
       // union (never-starve to the envelope set when the union comes up empty).
-      const exact = hasEraBound(eras) ? inYearRange(collected, eras) : collected;
+      let exact = hasEraBound(eras) ? inYearRange(collected, eras) : collected;
+      if (hasReleaseDate) exact = inReleaseDateRange(exact, releaseDateWindows);
       // Genre/era are server-side native here; enforce() adds the strict
       // mood/energy filters on top (no-op in soft mode).
       const leaned = enforce(preferEnergy(exact.length ? exact : collected, showEnergies));
@@ -356,16 +363,20 @@ async function refreshAutoPlaylistInner() {
       if (narrow) {
         // Same per-genre split + coarse era envelope as the dedicated source.
         const span = eraSpan(eras);
+        const releaseSpan = hasReleaseDate ? { fromYear: new Date().getUTCFullYear() - Math.ceil(Number(show.releaseDateMonths) / 12) - 1, toYear: new Date().getUTCFullYear() } : null;
+        const fromYear = span.fromYear ?? releaseSpan?.fromYear;
+        const toYear = span.toYear ?? releaseSpan?.toYear;
         random = [];
         for (const genreName of genreNames.length ? genreNames : [undefined]) {
           random.push(...await subsonic.getRandomSongs({
             size: Math.ceil(TARGET_POOL / Math.max(1, genreNames.length)),
             genre: genreName,
-            fromYear: span.fromYear ?? undefined,
-            toYear: span.toYear ?? undefined,
+            fromYear: fromYear ?? undefined,
+            toYear: toYear ?? undefined,
           }));
         }
-        const exact = hasEraBound(eras) ? inYearRange(random, eras) : random;
+        let exact = hasEraBound(eras) ? inYearRange(random, eras) : random;
+        if (hasReleaseDate) exact = inReleaseDateRange(exact, releaseDateWindows);
         random = exact.length ? exact : random;
       } else {
         random = await subsonic.getRandomSongs({ size: TARGET_POOL });
@@ -409,6 +420,11 @@ async function refreshAutoPlaylistInner() {
       energies: showEnergies,
       vocals: showVocals,
     }, { starve: false });
+    pool.length = 0;
+    pool.push(...filtered);
+  }
+  if (hasReleaseDate) {
+    const filtered = inReleaseDateRange(pool, releaseDateWindows);
     pool.length = 0;
     pool.push(...filtered);
   }

@@ -226,6 +226,7 @@ async function pickViaAgent(queue, ctx, { wantLink, audioWaypoint = null, curren
     genreLock = resolved.length ? resolved : null;
   }
   const eraLock = strict && hasEraBound(activeShow?.eras) ? activeShow!.eras : null;
+  const releaseDateLock = activeShow?.releaseDateMonths ? [{ months: activeShow.releaseDateMonths }] : null;
   // Mood / energy locks only bite when the tagger / analyzer has actually run:
   // an un-tagged / un-analysed library carries no mood / energy on ANY track,
   // so a hard lock would empty every tool for the whole show and trip the
@@ -268,6 +269,7 @@ async function pickViaAgent(queue, ctx, { wantLink, audioWaypoint = null, curren
     audioWaypoint,
     genreLock,
     eraLock,
+    releaseDateLock,
     moodLock,
     energyLock,
     vocalLock,

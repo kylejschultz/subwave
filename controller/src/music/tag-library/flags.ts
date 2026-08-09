@@ -116,6 +116,7 @@ export async function walkNavidrome(): Promise<{ walked: number; liveIds: Set<st
       // compilation's original date is the compilation's own, so its tracks
       // stay unresolved here and phase-0 asks MusicBrainz per track instead.
       originalYear: song.albumIsCompilation ? null : song.albumOriginalYear ?? null,
+      releaseDate: song.albumReleaseDate ?? null,
       isCompilation: song.albumIsCompilation ?? null,
       genres: subsonic.songGenres(song),
       duration: song.duration,
@@ -179,4 +180,3 @@ export async function applyWizardOverlay() {
     console.error('[setup-config] load failed:', err.message);
   }
 }
-

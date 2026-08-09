@@ -24,7 +24,7 @@
 import * as library from '../../../../music/library.js';
 import * as embeddings from '../../../../music/embeddings.js';
 import { filterPickerCandidates } from '../../../../music/recency.js';
-import { applyStrictLocks, type VocalMode } from '../../../../music/show-filter.js';
+import { applyStrictLocks, hasReleaseDateBound, inReleaseDateRange, type ReleaseDateWindow, type VocalMode } from '../../../../music/show-filter.js';
 import { freshnessBiasedOrder } from '../../../../music/airing.js';
 import { SEED_NOT_A_PICK_CLAUSE } from '../../../../util/pick-seed.js';
 import { slim } from './slim.js';
@@ -53,6 +53,10 @@ export interface PickerScope {
   // governs every filter). When set, candidates are year-filtered (inYearRange
   // — HARD, unknown-year tracks drop) before recency + cap. null/empty = no lock.
   eraLock: { fromYear?: number | null; toYear?: number | null }[] | null;
+  // Hard rolling album-release-date constraint. Unlike genre/mood/energy, this
+  // is not controlled by filtersStrict: a "new music" show must not leak older
+  // albums just because another source is thin.
+  releaseDateLock: ReleaseDateWindow[] | null;
   // Hard mood constraint for a strict show — any-of list: candidates are
   // filtered to tracks tagged with any of the show's moods (onlyMood — HARD).
   // null/empty = no lock.
@@ -98,6 +102,7 @@ const NO_SCOPE: PickerScope = {
   hardRecentKeys: new Set(),
   genreLock: null,
   eraLock: null,
+  releaseDateLock: null,
   moodLock: null,
   energyLock: null,
   vocalLock: null,
@@ -144,6 +149,7 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
   const {
     recentIds, recentKeys, hardRecentIds, hardRecentKeys,
     genreLock, eraLock, moodLock, energyLock, vocalLock,
+    releaseDateLock,
     playlistLock, excludedIds,
   } = scope;
 
@@ -193,6 +199,7 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
     let pool = applyStrictLocks(freshnessBiasedOrder((list || []) as any[], library.lastAiredInfo(), Date.now()), {
       genres: genreLock, eras: eraLock, moods: moodLock, energies: energyLock, vocals: vocalLock,
     }, { starve: true });
+    if (hasReleaseDateBound(releaseDateLock)) pool = inReleaseDateRange(pool, releaseDateLock);
     // Strict playlist: HARD-intersect with the lock set, with NO never-starve to
     // off-playlist (a playlist is an exact set, so a tool with no overlap simply
     // contributes nothing). The guaranteed in-set source is showPlaylistTracks,
@@ -233,7 +240,7 @@ export function buildPickerContext(scope: PickerScope): PickerContext {
   // the music filters, the playlist intersection, and the blocklist. Any of
   // them makes "matches exist but were filtered" a real cause the note should
   // name, not just recency.
-  const hasStrictLock = !!(genreLock?.length || eraLock?.length || moodLock?.length || energyLock?.length || vocalLock || playlistLock || excludedIds);
+  const hasStrictLock = !!(genreLock?.length || eraLock?.length || releaseDateLock?.length || moodLock?.length || energyLock?.length || vocalLock || playlistLock || excludedIds);
   // The seed clause rides HERE as well as on the schema field (#1247): this is
   // the message sitting in the model's context at the exact moment it fails, and
   // "never invent a song id" is literally satisfied by echoing the on-air id

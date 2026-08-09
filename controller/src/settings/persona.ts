@@ -127,6 +127,9 @@ function resolveShowShape(show, s) {
     moods: coerceShowMoods(show),
     genres: coerceShowGenres(show),
     eras: coerceShowEras(show),
+    releaseDateMonths: Number.isInteger(show.releaseDateMonths) && show.releaseDateMonths > 0
+      ? show.releaseDateMonths
+      : null,
     energies: coerceShowEnergies(show),
     // Instrumental / vocal steering, backed by Demucs vocal ranges. '' = no
     // constraint. Single-valued: the two states are mutually exclusive.
@@ -382,4 +385,3 @@ export function onAirRosterClause(persona: unknown, date: Date = new Date()): st
   }
   return '';
 }
-

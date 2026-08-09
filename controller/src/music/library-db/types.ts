@@ -21,6 +21,7 @@ export interface TrackRecord {
   originalYear: number | null;
   originalYearSource: string | null;      // 'album-tag' | 'musicbrainz'
   originalYearCheckedAt: string | null;   // last lookup attempt, hit or miss
+  releaseDate: string | null;             // album originalReleaseDate/releaseDate as YYYY-MM-DD
   isCompilation: boolean | null;          // Navidrome album flag; null = unknown
   // Every genre tag on the file (OpenSubsonic multi-value genres). The single
   // source of truth — `genre` below is a generated column over genres[0]
@@ -126,6 +127,7 @@ export interface TrackRow {
   original_year: number | null;
   original_year_source: string | null;
   original_year_checked_at: string | null;
+  release_date: string | null;
   is_compilation: number | null;
   genres: string | null; // JSON array; `genre` is generated from genres[0]
   genre: string | null;
@@ -173,6 +175,7 @@ export interface TrackMeta {
   // compilation's own, not its songs'). Never overwrites a per-track
   // 'musicbrainz' resolution — see upsertTrackMeta.
   originalYear?: number | null;
+  releaseDate?: string | null;
   isCompilation?: boolean | null;
 }
 
@@ -222,5 +225,4 @@ export interface LibraryStats {
   withAudioEmbedding: number;
   updatedAt: string | null;
 }
-
 

@@ -27,7 +27,7 @@ export function effectsGuidance(): string {
 }
 
 export type ShowEra = { fromYear?: number | null; toYear?: number | null };
-export type ShowMusic = { name: string; topic: string; moods?: string[]; genres?: string[]; eras?: ShowEra[]; energies?: string[]; vocals?: string | null; filtersStrict?: boolean };
+export type ShowMusic = { name: string; topic: string; moods?: string[]; genres?: string[]; eras?: ShowEra[]; releaseDateMonths?: number | null; energies?: string[]; vocals?: string | null; filtersStrict?: boolean };
 
 // One era window as prose ("1990–1999", "1970 onward", "up to 1989").
 function eraWindowText(e: ShowEra): string {
@@ -48,6 +48,9 @@ export function showMusicLean(show?: ShowMusic | null): string {
   const genres = show.genres ?? [];
   const moods = show.moods ?? [];
   const energies = show.energies ?? [];
+  const releaseDateText = show.releaseDateMonths && show.releaseDateMonths > 0
+    ? `albums released in the last ${show.releaseDateMonths} month${show.releaseDateMonths === 1 ? '' : 's'}`
+    : '';
   // '' / absent = no constraint. Rendered as prose rather than the stored token,
   // which reads as a flag name to a model rather than a property of the music.
   const vocalText = show.vocals === 'instrumental'
@@ -55,7 +58,7 @@ export function showMusicLean(show?: ShowMusic | null): string {
     : show.vocals === 'vocal' ? 'tracks with vocals' : '';
   const eraText = (show.eras ?? []).map(eraWindowText).filter(Boolean).join(' or ');
   // Strict only bites when there's actually a filter to lock to.
-  const hasFilter = !!(genres.length || moods.length || energies.length || vocalText || eraText);
+  const hasFilter = !!(genres.length || moods.length || energies.length || vocalText || eraText || releaseDateText);
   const strict = !!(show.filtersStrict && hasFilter);
   const or = (xs: string[]) => xs.join(' / ');
 
@@ -68,6 +71,7 @@ export function showMusicLean(show?: ShowMusic | null): string {
     const locks: string[] = [];
     if (genres.length) locks.push(`${or(genres)} tracks`);
     if (eraText) locks.push(`the ${eraText} era${(show.eras?.length ?? 0) > 1 ? 's' : ''}`);
+    if (releaseDateText) locks.push(releaseDateText);
     if (moods.length) locks.push(`the ${or(moods)} mood${moods.length > 1 ? 's' : ''}`);
     if (energies.length) locks.push(`${or(energies)}-energy tracks`);
     if (vocalText) locks.push(vocalText);
@@ -79,6 +83,7 @@ export function showMusicLean(show?: ShowMusic | null): string {
   const parts: string[] = [];
   if (genres.length) parts.push(`lean toward ${or(genres)}`);
   if (eraText) parts.push(`prefer tracks from ${eraText}`);
+  if (releaseDateText) parts.push(`only pick ${releaseDateText}`);
   if (energies.length) parts.push(`favour ${or(energies)}-energy tracks`);
   if (vocalText) parts.push(`favour ${vocalText}`);
   return parts.length

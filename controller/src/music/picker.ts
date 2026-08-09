@@ -17,7 +17,7 @@ import { shuffle } from '../util/shuffle.js';
 import { mapPool } from '../util/async-pool.js';
 import { artistRootKey, filterPickerCandidates, recencyWindowsForLibrary, effectiveNoRepeatWindow } from './recency.js';
 import { AIRING_RANK_WEIGHT, freshness, freshnessBiasedOrder, lastAiredMsOf, unairedFlag, type AiredIndex } from './airing.js';
-import { normGenre, genreMatches, genreResolutionWarningOnce, preferGenre, preferEra, inYearRange, preferEnergy, preferEnergyStrict, preferMood, preferVocals, applyStrictLocks, hasEraBound, eraSpan, type YearRange, type VocalMode } from './show-filter.js';
+import { normGenre, genreMatches, genreResolutionWarningOnce, preferGenre, preferEra, inYearRange, preferEnergy, preferEnergyStrict, preferMood, preferVocals, applyStrictLocks, hasEraBound, hasReleaseDateBound, eraSpan, inReleaseDateRange, preferReleaseDate, type YearRange, type ReleaseDateWindow, type VocalMode } from './show-filter.js';
 import { resolveShowPlaylistPool, resolveExcludedPlaylistIds, type PlaylistPool } from './show-playlist.js';
 import * as likes from '../broadcast/likes.js';
 
@@ -33,6 +33,7 @@ interface Candidate {
   artist?: string;
   album?: string;
   year?: number | string | null;
+  releaseDate?: string | null;
   genre?: string | null;
   duration?: number | null;
   moods?: string[] | null;
@@ -217,10 +218,10 @@ function softRankByCompat(pool: Candidate[], current: { bpm: number | null; key:
 
 // Multi-value lists (#929): OR within an attribute, AND across attributes.
 // Empty list = no constraint on that attribute.
-type ShowFilter = { moods: string[]; genres: string[]; eras: YearRange[]; energies: string[]; vocals: VocalMode; strict?: boolean } | null;
+type ShowFilter = { moods: string[]; genres: string[]; eras: YearRange[]; releaseDateWindows: ReleaseDateWindow[]; energies: string[]; vocals: VocalMode; strict?: boolean } | null;
 
 function hasMusicFilter(f: ShowFilter): boolean {
-  return !!f && (f.genres.length > 0 || hasEraBound(f.eras));
+  return !!f && (f.genres.length > 0 || hasEraBound(f.eras) || hasReleaseDateBound(f.releaseDateWindows));
 }
 
 // Genre / energy / era helpers (normGenre / genreMatches / preferGenre /
@@ -318,6 +319,7 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
   const strict = !!(showFilter?.strict
     && (showFilter.genres.length || showFilter.moods.length || showFilter.energies.length
       || showFilter.vocals || hasEraBound(showFilter.eras)));
+  const hasReleaseDate = hasReleaseDateBound(showFilter?.releaseDateWindows);
   // Resolve the show's free-text genres to the library's exact tags ONCE, up
   // front. A resolution failure drops that entry (never-starve: none resolving
   // means no genre filter at all, so misspelled genres never strand the show).
@@ -343,6 +345,7 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
     let out = items;
     if (strictGenres.length) out = preferGenre(out, strictGenres);
     out = preferEra(out, showFilter!.eras);
+    out = preferReleaseDate(out, showFilter!.releaseDateWindows);
     out = preferMood(out, showFilter!.moods);
     out = preferEnergyStrict(out, showFilter!.energies);
     out = preferVocals(out, showFilter!.vocals);
@@ -432,12 +435,14 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
     }
   }
 
-  // 1e. Show genres / decades — the soft-dominant source when a show pins
-  // genres or year windows. getRandomSongs takes ONE genre + ONE contiguous
-  // year range natively, so with multiple values we call per genre (splitting
-  // the size budget) against the eras' coarse envelope (eraSpan), then post-
-  // filter the genre-tagged sets to the exact era union (inYearRange). The
-  // whole collection is then energy-preferred. Never a hard filter — see helpers.
+  // 1e. Show genres / decades / rolling release window — the soft-dominant
+  // source when a show pins genres, year windows, or a recent-release window.
+  // getRandomSongs takes ONE genre + ONE contiguous year range natively, so
+  // with multiple values we call per genre (splitting the size budget) against
+  // the eras' coarse envelope (eraSpan), then post-filter the genre-tagged sets
+  // to the exact era union (inYearRange). Rolling release dates have no native
+  // Navidrome query; fetch broadly by year envelope and enforce exact dates
+  // locally. The whole collection is then energy-preferred.
   if (hasMusicFilter(showFilter)) {
     try {
       // Reuse the strict-resolved tags when we already paid for them above;
@@ -453,6 +458,9 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
         }
       }
       const span = eraSpan(showFilter!.eras);
+      const releaseSpan = hasReleaseDate ? { fromYear: new Date().getUTCFullYear() - Math.ceil(Math.max(...showFilter!.releaseDateWindows.map(w => Number(w.months ?? 0))) / 12) - 1, toYear: new Date().getUTCFullYear() } : null;
+      const fromYear = span.fromYear ?? releaseSpan?.fromYear;
+      const toYear = span.toYear ?? releaseSpan?.toYear;
       const randomSize = strict ? 60 : 40;
       const genreSetSize = strict ? 100 : 60;
       // Two fetches per genre. The size budgets DIVIDE, so the collected total
@@ -471,8 +479,8 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
           got.push(...await subsonic.getRandomSongs({
             size: Math.ceil(randomSize / Math.max(1, genreNames.length)),
             genre: genreName,
-            fromYear: span.fromYear ?? undefined,
-            toYear: span.toYear ?? undefined,
+            fromYear: fromYear ?? undefined,
+            toYear: toYear ?? undefined,
           }));
         } catch {}
         if (genreName) {
@@ -490,7 +498,8 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
       // The random fetch used the coarse era envelope — tighten to the exact
       // window union here (never-starve: keep the envelope set if the exact
       // union would empty the source).
-      const exact = hasEraBound(showFilter!.eras) ? inYearRange(collected, showFilter!.eras) : collected;
+      let exact = hasEraBound(showFilter!.eras) ? inYearRange(collected, showFilter!.eras) : collected;
+      if (hasReleaseDate) exact = inReleaseDateRange(exact, showFilter!.releaseDateWindows);
       // Genre/era are already native to this source; lean() adds the strict
       // mood/energy filters on top (no-op in soft mode).
       const leaned = lean(preferEnergy(exact.length ? exact : collected, showFilter!.energies));
@@ -698,6 +707,9 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
       vocals: showFilter!.vocals,
     }, { starve: false });
   }
+  if (hasReleaseDate) {
+    selectionPool = inReleaseDateRange(selectionPool, showFilter!.releaseDateWindows);
+  }
 
   // De-dup by id, cap per artist so one name can't dominate the pool (the LLM
   // can only rotate artists across what it's handed), shuffle, cap.
@@ -831,6 +843,7 @@ export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; 
         moods: activeShow.moods ?? [],
         genres: activeShow.genres ?? [],
         eras: activeShow.eras ?? [],
+        releaseDateWindows: activeShow.releaseDateMonths ? [{ months: activeShow.releaseDateMonths }] : [],
         energies: activeShow.energies ?? [],
         vocals: (activeShow.vocals ?? '') as VocalMode,
         strict: activeShow.filtersStrict,
@@ -930,6 +943,7 @@ export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; 
             moods: activeShow.moods,
             genres: activeShow.genres,
             eras: activeShow.eras,
+            releaseDateMonths: activeShow.releaseDateMonths,
             energies: activeShow.energies,
             vocals: activeShow.vocals,
             filtersStrict: activeShow.filtersStrict,

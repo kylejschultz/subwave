@@ -42,9 +42,9 @@ const read = (p: string) => readFileSync(resolve(here, p), 'utf8');
 
 // A candidate list spanning every dimension a lock can filter on.
 const CANDIDATES = [
-  { id: 'a', title: 'A', artist: 'X', year: 1975, genres: ['Punk Rock'], moods: ['night'], energy: 'high', vocalRanges: [[0, 1000]] },
-  { id: 'b', title: 'B', artist: 'Y', year: 1995, genres: ['Jazz'], moods: ['calm'], energy: 'low', vocalRanges: [] },
-  { id: 'c', title: 'C', artist: 'Z', year: 2015, genres: ['Jazz'], moods: ['night'], energy: 'low', vocalRanges: [[0, 500]] },
+  { id: 'a', title: 'A', artist: 'X', year: 1975, releaseDate: new Date().toISOString().slice(0, 10), genres: ['Punk Rock'], moods: ['night'], energy: 'high', vocalRanges: [[0, 1000]] },
+  { id: 'b', title: 'B', artist: 'Y', year: 1995, releaseDate: '2000-01-01', genres: ['Jazz'], moods: ['calm'], energy: 'low', vocalRanges: [] },
+  { id: 'c', title: 'C', artist: 'Z', year: 2015, releaseDate: new Date().toISOString().slice(0, 10), genres: ['Jazz'], moods: ['night'], energy: 'low', vocalRanges: [[0, 500]] },
 ];
 
 const idsFor = (partial: Partial<PickerScope>) => {
@@ -63,7 +63,7 @@ test('every field has a no-constraint default, so a caller states only what it c
   // The locks must default to null/empty rather than undefined: `undefined`
   // reads the same at a call site but means "field absent" to anything that
   // enumerates the scope, which is how a dropped lock hid before.
-  for (const k of ['genreLock', 'eraLock', 'moodLock', 'energyLock', 'vocalLock', 'playlistLock', 'playlistTracks', 'excludedIds', 'audioWaypoint'] as const) {
+  for (const k of ['genreLock', 'eraLock', 'releaseDateLock', 'moodLock', 'energyLock', 'vocalLock', 'playlistLock', 'playlistTracks', 'excludedIds', 'audioWaypoint'] as const) {
     assert.equal(s[k], null, `${k} must default to null`);
   }
   assert.equal(s.resolveReferences, false);
@@ -83,6 +83,10 @@ test('genreLock drops off-genre candidates (refine direction: "Punk" admits "Pun
 
 test('eraLock drops out-of-window candidates', () => {
   assert.deepEqual(idsFor({ eraLock: [{ fromYear: 1990, toYear: 1999 }] }), ['b']);
+});
+
+test('releaseDateLock drops old-release candidates', () => {
+  assert.deepEqual(idsFor({ releaseDateLock: [{ months: 1 }] }), ['a', 'c']);
 });
 
 test('moodLock drops untagged-for-that-mood candidates', () => {

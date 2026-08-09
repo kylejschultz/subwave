@@ -60,6 +60,10 @@ export interface Show {
    *  resolved fuzzily against the library. */
   genres: string[];
   eras: EraWindow[];
+  /** Albums released within the last N months. null = no rolling release-date
+   *  filter. Uses album release dates from Navidrome; unknown dates do not
+   *  qualify. */
+  releaseDateMonths: number | null;
   energies: string[];
   /** Single-valued, unlike the lists above: the two states are mutually
    *  exclusive. '' = no constraint, and is what every show predating the field
@@ -102,6 +106,7 @@ export interface CommunityShow {
   moods: string[];
   genres: string[];
   eras: EraWindow[];
+  releaseDateMonths?: number | null;
   energies: string[];
   filtersStrict: boolean;
   banter: boolean;
@@ -193,4 +198,3 @@ export interface SettingsResponse {
   };
   tts?: { moods?: string[] };
 }
-

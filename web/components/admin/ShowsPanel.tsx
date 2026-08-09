@@ -239,7 +239,7 @@ export default function ShowsPanel() {
         shows: [...f.shows, {
           id, name: '', topic: '',
           personaId: personas[0]?.id || '', guestPersonaIds: [], banter: false, moods: [],
-          themeId: '', genres: [], eras: [], energies: [], vocals: '',
+          themeId: '', genres: [], eras: [], releaseDateMonths: null, energies: [], vocals: '',
           filtersStrict: false, maxTrackSeconds: null,
           playlistIds: [], playlistStrict: false, excludedPlaylistIds: [],
           programme: false, segmentSkill: '',
@@ -613,4 +613,3 @@ export default function ShowsPanel() {
     </div>
   );
 }
-

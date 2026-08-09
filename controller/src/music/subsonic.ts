@@ -709,6 +709,28 @@ export async function getStructuredLyrics(
   }
 }
 
+function albumFullReleaseDate(album: any): string | null {
+  const ord = album?.originalReleaseDate;
+  const y = Number(ord?.year);
+  const m = Number(ord?.month);
+  const d = Number(ord?.day);
+  if (Number.isInteger(y) && Number.isInteger(m) && Number.isInteger(d)
+    && y > 0 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d) {
+      return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+  const raw = typeof album?.releaseDate === 'string' ? album.releaseDate.trim() : '';
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const yy = Number(match[1]);
+  const mm = Number(match[2]);
+  const dd = Number(match[3]);
+  const dt = new Date(Date.UTC(yy, mm - 1, dd));
+  return dt.getUTCFullYear() === yy && dt.getUTCMonth() === mm - 1 && dt.getUTCDate() === dd ? raw : null;
+}
+
 // Async iterator over every song in the library. Walks albums in batches.
 // Each yielded song is annotated with the album-level era signals Navidrome
 // only exposes on the album record (issue #842): `albumIsCompilation`
@@ -729,9 +751,10 @@ export async function* iterateAllSongs() {
         const isCompilation = typeof r.album?.isCompilation === 'boolean' ? r.album.isCompilation : null;
         const ord = r.album?.originalReleaseDate?.year;
         const originalYear = Number.isFinite(ord) && ord > 0 ? ord : null;
+        const releaseDate = albumFullReleaseDate(r.album);
         // Same station-archive drop as getAlbum() (issue #273).
         for (const s of rejectArchive(r.album?.song || [])) {
-          yield { ...s, albumIsCompilation: isCompilation, albumOriginalYear: originalYear };
+          yield { ...s, albumIsCompilation: isCompilation, albumOriginalYear: originalYear, albumReleaseDate: releaseDate };
         }
       } catch (err) {
         console.error(`[subsonic] getAlbum(${album.id}) failed: ${err.message}`);

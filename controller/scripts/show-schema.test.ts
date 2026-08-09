@@ -23,6 +23,7 @@ const {
   SHOWS_LIMIT,
   SHOW_FILTER_VALUES_MAX,
   SHOW_NAME_MAX,
+  SHOW_RELEASE_MONTHS_MAX,
   SHOW_TOPIC_MAX,
   migrateLegacyShowFields,
   showSchema,
@@ -54,6 +55,7 @@ test('a minimal show validates and every optional field defaults', () => {
   assert.equal(s.banter, false);
   assert.equal(s.programme, false);
   assert.equal(s.filtersStrict, false);
+  assert.equal(s.releaseDateMonths, null);
   assert.deepEqual(s.moods, []);
   assert.deepEqual(s.genres, []);
   assert.deepEqual(s.eras, []);
@@ -113,6 +115,15 @@ test('maxTrackSeconds honours the crossfade-derived floor, and 0 always passes',
   assert.equal(strict({ maxTrackSeconds: '' }).maxTrackSeconds, null);
   assert.throws(() => strict({ maxTrackSeconds: 5 }), /maxTrackSeconds/);
   assert.throws(() => strict({ maxTrackSeconds: 1_000_000 }), /maxTrackSeconds/);
+});
+
+test('releaseDateMonths is optional, bounded, and numeric-string friendly', () => {
+  assert.equal(strict({ releaseDateMonths: 3 }).releaseDateMonths, 3);
+  assert.equal(strict({ releaseDateMonths: '6' }).releaseDateMonths, 6);
+  assert.equal(strict({ releaseDateMonths: '' }).releaseDateMonths, null);
+  assert.equal(strict({ releaseDateMonths: null }).releaseDateMonths, null);
+  assert.throws(() => strict({ releaseDateMonths: 0 }), /releaseDateMonths/);
+  assert.throws(() => strict({ releaseDateMonths: SHOW_RELEASE_MONTHS_MAX + 1 }), /releaseDateMonths/);
 });
 
 test('booleans read as `=== true`, matching both paths before the schema', () => {
@@ -221,6 +232,7 @@ test('load repairs what a working show can survive; strict rejects the same inpu
     [{ vocals: 'nonsense' }, (s) => assert.equal(s.vocals, '')],
     [{ energies: ['low', 'bogus'] }, (s) => assert.deepEqual(s.energies, ['low'])],
     [{ maxTrackSeconds: 9_999_999 }, (s) => assert.ok(s.maxTrackSeconds <= 36000)],
+    [{ releaseDateMonths: 999 }, (s) => assert.equal(s.releaseDateMonths, null)],
     [{ eras: [{ fromYear: 2000, toYear: 1990 }] }, (s) => assert.deepEqual(s.eras, [])],
     [{ guestPersonaIds: ['p_host', 'p_gone', 'p_guest'] },
       (s) => assert.deepEqual(s.guestPersonaIds, ['p_guest'])],
@@ -316,7 +328,7 @@ test('explicit null reads as absent on every optional field', () => {
   // array, one null field on one show failed the entire shows/schedule save.
   const s = strict({
     topic: null, segmentSkill: null, themeId: null, vocals: null,
-    moods: null, genres: null, energies: null, eras: null,
+    moods: null, genres: null, energies: null, eras: null, releaseDateMonths: null,
     guestPersonaIds: null, playlistIds: null, excludedPlaylistIds: null,
   });
   assert.equal(s.topic, '');
@@ -324,6 +336,7 @@ test('explicit null reads as absent on every optional field', () => {
   assert.equal(s.themeId, '');
   assert.deepEqual(s.moods, []);
   assert.deepEqual(s.eras, []);
+  assert.equal(s.releaseDateMonths, null);
   assert.deepEqual(s.guestPersonaIds, []);
   assert.deepEqual(s.playlistIds, []);
 });

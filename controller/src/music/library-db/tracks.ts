@@ -28,6 +28,7 @@ export interface TrackLite {
   // Era-year surface (issue #842) — lets show-filter resolve a track's true
   // era without the full getTrack() blob parse. null = unresolved / unknown.
   originalYear: number | null;
+  releaseDate: string | null;
   isCompilation: boolean | null;
   durationSec: number | null;
 }
@@ -41,8 +42,8 @@ export interface TrackLite {
 // concurrent HTTP response, making the whole UI sluggish (#723).
 export function getTrackLite(id: string): TrackLite | null {
   const row = requireDb()
-    .prepare(`SELECT genres, genre, bpm, musical_key, moods, energy, year, original_year, is_compilation, duration_sec FROM tracks WHERE id = ?`)
-    .get(id) as Pick<TrackRow, 'genres' | 'genre' | 'bpm' | 'musical_key' | 'moods' | 'energy' | 'year' | 'original_year' | 'is_compilation' | 'duration_sec'> | undefined;
+    .prepare(`SELECT genres, genre, bpm, musical_key, moods, energy, year, original_year, release_date, is_compilation, duration_sec FROM tracks WHERE id = ?`)
+    .get(id) as Pick<TrackRow, 'genres' | 'genre' | 'bpm' | 'musical_key' | 'moods' | 'energy' | 'year' | 'original_year' | 'release_date' | 'is_compilation' | 'duration_sec'> | undefined;
   if (!row) return null;
   return {
     genres: row.genres ? safeParseArray(row.genres) : [],
@@ -53,6 +54,7 @@ export function getTrackLite(id: string): TrackLite | null {
     energy: row.energy ?? null,
     year: row.year ?? null,
     originalYear: row.original_year ?? null,
+    releaseDate: row.release_date ?? null,
     isCompilation: row.is_compilation == null ? null : !!row.is_compilation,
     durationSec: row.duration_sec ?? null,
   };
@@ -87,8 +89,8 @@ export function upsertTrackMeta(id: string, meta: TrackMeta): void {
   requireDb()
     .prepare(
       `
-      INSERT INTO tracks (id, title, artist, album, year, original_year, original_year_source, is_compilation, genres, duration_sec)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tracks (id, title, artist, album, year, original_year, original_year_source, release_date, is_compilation, genres, duration_sec)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         title        = COALESCE(excluded.title, tracks.title),
         artist       = COALESCE(excluded.artist, tracks.artist),
@@ -102,6 +104,7 @@ export function upsertTrackMeta(id: string, meta: TrackMeta): void {
         original_year_source = CASE WHEN tracks.original_year_source = 'musicbrainz'
                                     THEN tracks.original_year_source
                                     ELSE COALESCE(excluded.original_year_source, tracks.original_year_source) END,
+        release_date = COALESCE(excluded.release_date, tracks.release_date),
         is_compilation = COALESCE(excluded.is_compilation, tracks.is_compilation),
         genres       = COALESCE(excluded.genres, tracks.genres),
         duration_sec = COALESCE(excluded.duration_sec, tracks.duration_sec)
@@ -115,6 +118,7 @@ export function upsertTrackMeta(id: string, meta: TrackMeta): void {
       normaliseYear(meta.year),
       normaliseYear(meta.originalYear),
       normaliseYear(meta.originalYear) != null ? 'album-tag' : null,
+      meta.releaseDate ?? null,
       meta.isCompilation == null ? null : meta.isCompilation ? 1 : 0,
       meta.genres?.length ? JSON.stringify(meta.genres) : null,
       Number.isFinite(meta.duration as number) ? (meta.duration as number) : null,
@@ -482,5 +486,4 @@ export function upsertTrackAudioVector(id: string, vector: number[] | Float32Arr
   d.prepare(`DELETE FROM track_audio_vectors WHERE id = ?`).run(id);
   d.prepare(`INSERT INTO track_audio_vectors (id, embedding) VALUES (?, ?)`).run(id, buf);
 }
-
 

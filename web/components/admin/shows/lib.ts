@@ -45,6 +45,7 @@ export function hydrateShow(s: Partial<Show>): Show {
     themeId: m.themeId ?? '',
     genres: Array.isArray(m.genres) ? m.genres.map(g => String(g).trim()).filter(Boolean) : [],
     eras: Array.isArray(m.eras) ? m.eras : [],
+    releaseDateMonths: Number.isInteger(m.releaseDateMonths) ? m.releaseDateMonths! : null,
     energies: Array.isArray(m.energies) ? m.energies : [],
     // Anything unrecognised reads as no constraint, matching the schema's own
     // vocals field — a steering filter that silently stops applying is a far
@@ -146,7 +147,7 @@ export function showFieldErrors(s: Show, ctx: ShowSchemaContext): Record<string,
 // At least one music filter set — the Strict filter toggle only means
 // something when there's a filter for it to harden.
 export function hasAnyMusicFilter(s: Show): boolean {
-  return !!(s.moods.length || s.genres.length || s.energies.length || s.eras.length || s.vocals);
+  return !!(s.moods.length || s.genres.length || s.energies.length || s.eras.length || s.releaseDateMonths || s.vocals);
 }
 
 // Trimmed, with the "only-means-something-with" conditionals the server also
@@ -166,6 +167,7 @@ export function showPayload(s: Show) {
     themeId: s.themeId || '',
     genres: s.genres.map(g => g.trim()).filter(Boolean),
     eras: s.eras,
+    releaseDateMonths: s.releaseDateMonths,
     energies: s.energies,
     vocals: s.vocals || '',
     // Strict only means something with at least one music filter set.
@@ -190,6 +192,7 @@ export function showFacets(s: Show): ShowFacet[] {
   else facets.push({ key: 'mood-any', label: 'any mood' });
   s.genres.forEach(g => facets.push({ key: `genre-${g}`, label: g }));
   s.eras.forEach((e, idx) => facets.push({ key: `era-${idx}`, label: eraLabelOf(e) }));
+  if (s.releaseDateMonths) facets.push({ key: 'release-date', label: `last ${s.releaseDateMonths} mo` });
   s.energies.forEach(en => facets.push({ key: `energy-${en}`, label: en }));
   if (s.vocals) facets.push({ key: 'vocals', label: s.vocals === 'instrumental' ? 'instrumental' : 'vocals' });
   if (s.filtersStrict && hasAnyMusicFilter(s)) facets.push({ key: 'strict', label: 'strict', accent: true });
@@ -249,5 +252,4 @@ export function showRow(
     ok: showValid(s, ctx),
   };
 }
-
 

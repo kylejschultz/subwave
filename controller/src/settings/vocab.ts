@@ -970,6 +970,7 @@ export interface NormalizedShow {
   themeId: string;
   genres: string[];
   eras: EraWindow[];
+  releaseDateMonths: number | null;
   energies: string[];
   /** '' = no constraint. See SHOW_VOCALS. */
   vocals: string;
@@ -1137,4 +1138,3 @@ export const AAC_BITRATES = SETTINGS_AAC_BITRATES;
 // the analyzer's measured LUFS, or tag-with-measured-fallback (the default).
 export const LOUDNESS_SOURCES = SETTINGS_LOUDNESS_SOURCES;
 export type LoudnessSource = (typeof LOUDNESS_SOURCES)[number];
-
