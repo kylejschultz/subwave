@@ -113,13 +113,19 @@ const CAPS: Record<string, ProviderCapabilities> = {
   openai: {
     objectStrategy: 'native',
     repeatPenaltyApplies: false,
-    // o-series / gpt-5 always reason; only effort is tunable — 'minimal' is the
-    // floor ('none' is rejected). The model-id gate must stay: the provider
-    // forwards the level as reasoning_effort VERBATIM, and gpt-4-class models
-    // 400 on receiving it. forceNoThink not factored — these models permit
-    // forced tools while reasoning.
+    // GPT-5.6 has its own effort scale: none/low/medium/high/xhigh/max. In
+    // particular it rejects the older `minimal` floor, so it must be checked
+    // before the legacy gpt-5 family. Older o-series / gpt-5 models require
+    // reasoning and reject `none`; their lowest valid effort remains minimal.
+    // gpt-4-class models 400 on any reasoning_effort, so omit it for them.
+    // forceNoThink is not factored — OpenAI models permit forced tools while
+    // reasoning.
     reasoningLevel: ({ modelId, reasoning }) =>
-      /^(o\d|gpt-5)/i.test(modelId) ? (reasoning ? 'medium' : 'minimal') : undefined,
+      /^gpt-5\.6(?:$|[-.])/i.test(modelId)
+        ? (reasoning ? 'medium' : 'none')
+        : /^(o\d|gpt-5)/i.test(modelId)
+          ? (reasoning ? 'medium' : 'minimal')
+          : undefined,
     discoverySteps: NATIVE_DISCOVERY_STEPS,
   },
   // openai-compatible targets self-hosted llama.cpp / vLLM / LM Studio — the

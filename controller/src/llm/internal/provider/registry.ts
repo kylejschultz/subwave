@@ -105,8 +105,8 @@ export function noThinkFetch(url: any, init: any, baseFetch: any = fetch) {
 //     #1327 looked like this guard and was settings.load() dropping the field;
 //     check `settings.get().llm.repeatPenalty` before touching it.
 //   • reasoning off → enable_thinking:false PLUS reasoning_format PLUS an
-//     OpenRouter-style `reasoning:{enabled:false}` block (reasoningMandatoryModel
-//     below carries the effort:'minimal' exception). All three are needed
+//     OpenRouter-style reasoning block (reasoningSuppressionFor below selects the
+//     model family's valid suppression setting). All three are needed
 //     because each covers a different server:
 //       - chat_template_kwargs is a llama.cpp dialect and does nothing on a
 //         CLOUD aggregator behind this provider — measured 57/96 with 16 leaked
@@ -158,9 +158,7 @@ export function openAICompatibleFetch(cfg: any, baseFetch: any = fetch, forceNoT
           if (body.reasoning_format === undefined) body.reasoning_format = 'deepseek';
           if (body.thinking === undefined) body.thinking = { type: 'disabled' };
           if (body.reasoning === undefined) {
-            body.reasoning = reasoningMandatoryModel(String(body.model || ''))
-              ? { effort: 'minimal' }
-              : { enabled: false };
+            body.reasoning = reasoningSuppressionFor(String(body.model || ''));
           }
         }
         if (Array.isArray(body.tools) && body.tools.length > 0 &&
@@ -174,16 +172,17 @@ export function openAICompatibleFetch(cfg: any, baseFetch: any = fetch, forceNoT
   };
 }
 
-// Reasoning-MANDATORY model families 400 on a hard reasoning disable
-// (`reasoning:{enabled:false}`): OpenAI's gpt-5/o-series ("Reasoning is
-// mandatory for this endpoint") and reasoning-only DeepSeek R1 variants. Every
-// model accepts `effort:'minimal'`, which satisfies the mandate while dropping
-// thinking low enough that forced tool calls still land. Shared by the
-// openrouter construction wiring and the openai-compatible body injection —
-// kept broad at openai/* (harmlessly dropped on non-reasoning openai models;
-// gpt-4o-mini benched clean with it).
-export function reasoningMandatoryModel(id: string): boolean {
-  return /^openai\//i.test(id) || /(^|\/)deepseek-r1/i.test(id);
+// The suppression shape is model-family-specific. GPT-5.6 supports `none` but
+// rejects the legacy `minimal` floor. Older OpenAI o-series / GPT-5 models and
+// DeepSeek R1 require reasoning, so they use `minimal` instead of a hard
+// disable. All other models get the normal OpenRouter off switch.
+export function reasoningSuppressionFor(id: string): Record<string, unknown> {
+  const openaiModel = id.replace(/^openai\//i, '');
+  if (/^gpt-5\.6(?:$|[-.])/i.test(openaiModel)) return { effort: 'none' };
+  if (/^openai\/(?:o\d|gpt-5)/i.test(id) || /(^|\/)deepseek-r1/i.test(id)) {
+    return { effort: 'minimal' };
+  }
+  return { enabled: false };
 }
 
 // Ollama server URL — from settings (admin UI), falling back to the config
@@ -331,10 +330,11 @@ export function languageModel(cfg: any = llmCfg(), opts: { forceNoThink?: boolea
       // providerOptions — so the toggle must be wired HERE or it's dead (we used
       // to pass nothing → models reasoned by default). We MINIMISE rather than
       // disable reasoning when suppressing: some OpenRouter models mandate it —
-      // OpenAI gpt-5/o-series 400 with "Reasoning is mandatory for this endpoint"
-      // on `enabled:false` — but every model accepts `effort:'minimal'`, which
-      // both satisfies the mandate AND drops thinking low enough that
-      // reasoning-rejects-tools models (mimo) can still emit forced tool calls.
+      // Older OpenAI gpt-5/o-series 400 with "Reasoning is mandatory for this
+      // endpoint" on `enabled:false` — their valid low floor is `minimal`, while
+      // GPT-5.6 instead accepts `none`. The helper below selects the appropriate
+      // setting, so reasoning-rejects-tools models (mimo) can still emit forced
+      // tool calls.
       // Suppress on forced-tool legs (constructionNoThink) and when the operator
       // turns reasoning off; otherwise leave the model's default reasoning. This
       // lets the DJ's free-text keep full reasoning while the picker runs minimal,
@@ -352,12 +352,11 @@ export function languageModel(cfg: any = llmCfg(), opts: { forceNoThink?: boolea
       //   - Anthropic: OpenRouter maps ANY effort onto a thinking BUDGET, so
       //     'minimal' turned thinking ON for claude-haiku-4.5 (81 leaked
       //     cells) — the suppression knob was the thing enabling it.
-      // effort:'minimal' survives ONLY for the reasoning-MANDATORY families,
-      // which 400 on enabled:false ("Reasoning is mandatory") — see
-      // reasoningMandatoryModel above (shared with the openai-compatible
+      // family-specific effort survives ONLY where a hard disable is invalid —
+      // see reasoningSuppressionFor above (shared with the openai-compatible
       // body injection).
       model = suppressReasoning
-        ? provider(id, { extraBody: { reasoning: reasoningMandatoryModel(id) ? { effort: 'minimal' } : { enabled: false } } })
+        ? provider(id, { extraBody: { reasoning: reasoningSuppressionFor(id) } })
         : provider(id);
       break;
     }

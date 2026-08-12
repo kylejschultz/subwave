@@ -16,7 +16,7 @@ import { reasoningFor, needsToolCallObject, repeatPenaltyApplies, appliedNumCtx,
 import { agentPlan } from '../src/llm/internal/strategy/plan.js';
 import { introBudgetPhrase, enforceIntroBudget } from '../src/llm/internal/prompts/intro-budget.js';
 import { embeddingBaseUrl } from '../src/llm/internal/provider/embedding.js';
-import { DEFAULT_LOCCA_EMBED_BASE_URL, openAICompatibleFetch } from '../src/llm/internal/provider/registry.js';
+import { DEFAULT_LOCCA_EMBED_BASE_URL, openAICompatibleFetch, reasoningSuppressionFor } from '../src/llm/internal/provider/registry.js';
 import { personaToneDirectives, normalizeDial, DIAL_NEUTRAL, validatePersonasStrict, clampTtsSpeed, TTS_SPEED_DEFAULT, clampMaxOutputTokens, resolveMaxOutputTokens, MAX_OUTPUT_TOKENS_MIN, MAX_OUTPUT_TOKENS_MAX, effectiveFrequency, SCRIPT_LENGTHS } from '../src/settings.js';
 import { lengthMode, lengthPhrase } from '../src/llm/internal/prompts/system.js';
 import { showMusicLean } from '../src/llm/internal/prompts/picker.js';
@@ -371,10 +371,14 @@ async function main() {
     assert.equal(reasoningFor({ provider: 'google', model: 'gemma-4-31b-it', reasoning: true }), undefined);
     assert.equal(reasoningFor({ provider: 'google', model: 'gemma-2-27b-it', reasoning: false }), undefined);
   });
-  await test('openai: effort level only on o-series/gpt-5 (sent verbatim as reasoning_effort — gpt-4-class 400s on it)', () => {
+  await test('openai: GPT-5.6 uses none when disabled; legacy o-series/gpt-5 keeps minimal (gpt-4-class omits the param)', () => {
     assert.equal(reasoningFor({ provider: 'openai', model: 'o3', reasoning: false }), 'minimal');
     assert.equal(reasoningFor({ provider: 'openai', model: 'o3', reasoning: true }), 'medium');
     assert.equal(reasoningFor({ provider: 'openai', model: 'gpt-5-mini', reasoning: true }), 'medium');
+    for (const model of ['gpt-5.6', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol']) {
+      assert.equal(reasoningFor({ provider: 'openai', model, reasoning: false }), 'none', model);
+      assert.equal(reasoningFor({ provider: 'openai', model, reasoning: true }), 'medium', model);
+    }
     assert.equal(reasoningFor({ provider: 'openai', model: 'gpt-4.1-mini', reasoning: false }), undefined);
   });
   await test('requesty: minimal when suppressing — same wire bytes as the old providerOptions.requesty block', () => {
@@ -461,10 +465,12 @@ async function main() {
     assert.equal(sent.reasoning_format, 'deepseek');
     assert.deepEqual(sent.reasoning, { enabled: false });
   });
-  await test('aggregator dialect: reasoning-mandatory model ids get effort:minimal, never enabled:false; existing body.reasoning never clobbered', async () => {
+  await test('aggregator dialect: GPT-5.6 gets effort:none; mandatory families retain minimal; existing body.reasoning never clobbered', async () => {
     let sent: any = null;
     const impl = openAICompatibleFetch({ provider: 'openai-compatible', reasoning: false }, async (_u: any, init: any) => { sent = JSON.parse(init.body); return {} as any; }, false);
-    // gpt-5/o-series behind an aggregator 400 on enabled:false ("Reasoning is mandatory").
+    await impl('http://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'openai/gpt-5.6-luna', messages: [] }) });
+    assert.deepEqual(sent.reasoning, { effort: 'none' });
+    // Older gpt-5/o-series behind an aggregator 400 on enabled:false.
     await impl('http://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'openai/gpt-5-mini', messages: [] }) });
     assert.deepEqual(sent.reasoning, { effort: 'minimal' });
     // deepseek-r1 variants are reasoning-only too.
@@ -473,6 +479,11 @@ async function main() {
     // A caller-set reasoning block wins — same never-clobber rule as every knob here.
     await impl('http://x/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm', reasoning: { effort: 'high' }, messages: [] }) });
     assert.deepEqual(sent.reasoning, { effort: 'high' });
+  });
+  await test('reasoning suppression helper keeps the three model families distinct', () => {
+    assert.deepEqual(reasoningSuppressionFor('openai/gpt-5.6-terra'), { effort: 'none' });
+    assert.deepEqual(reasoningSuppressionFor('openai/o3'), { effort: 'minimal' });
+    assert.deepEqual(reasoningSuppressionFor('openai/gpt-4.1-mini'), { enabled: false });
   });
 
   await test('forcedToolChoice: only the literal "auto" downgrades; everything else is "required" (issue #570)', () => {
