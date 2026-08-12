@@ -11,13 +11,12 @@ import {
 import { Card, Btn, Pill, Seg } from '../ui';
 import { LocationPicker, type GeocodeResult } from '../../LocationPicker';
 import {
-  SectionHeader, SaveBar,
+  SectionHeader, SaveBar, SettingsFieldError,
   type SectionProps,
 } from './shared';
 
-// IANA zones grouped by region prefix for the timezone select. Built once —
-// Intl.supportedValuesOf exists in every runtime this UI supports, but the
-// guard keeps an exotic browser from crashing the whole settings page.
+// Intl.supportedValuesOf exists in every runtime this UI supports; the guard keeps
+// an exotic browser from crashing the whole settings page.
 const TZ_GROUPS: Array<{ region: string; zones: string[] }> = (() => {
   let zones: string[] = [];
   try { zones = Intl.supportedValuesOf('timeZone'); } catch { /* select offers Auto only */ }
@@ -42,9 +41,8 @@ const ON_OFF = [
   { id: 'off', label: 'Off' },
 ] as const;
 
-export function StationSection({ data, form, setForm, busy, saveSettings }: SectionProps) {
-  // Persisted state, for the "restart required" pill (shown only when the
-  // stream toggle differs from what's on file) and the password placeholder.
+export function StationSection({ data, form, setForm, busy, saveSettings, fieldErrors }: SectionProps) {
+  // Persisted state, for the "restart required" pill and the password placeholder.
   const authOnFile = data.values?.privacy?.listenerAuth === true;
   const passwordOnFile = data.values?.privacy?.password === 'set';
   const save = () => saveSettings({
@@ -62,8 +60,8 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
     privacy: {
       privatePlayer: form.privacy.privatePlayer,
       listenerAuth: form.privacy.listenerAuth,
-      // 'set' is the redaction sentinel — the controller ignores it, so an
-      // untouched field never clobbers the stored password.
+      // 'set' is the redaction sentinel: the controller ignores it, so an untouched
+      // field never clobbers the stored password.
       password: form.privacy.password,
       publishPersonaSouls: form.privacy.publishPersonaSouls,
     },
@@ -78,8 +76,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
     },
   });
 
-  // Re-render every 30s so the station-clock preview keeps walking — it's
-  // the operator's sanity check that the selected zone matches their watch.
+  // Re-render every 30s so the station-clock preview keeps walking.
   const [, setClockTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setClockTick(t => t + 1), 30_000);
@@ -92,16 +89,15 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
   const preview = clockPreview(previewTz, form.locale);
   const localeLabel = form.locale === 'en-US' ? 'English (US)' : 'English (UK)';
 
-  // A picked city carries its IANA zone. We *suggest* it rather than overwrite —
-  // the operator may have deliberately set a different station clock. Cleared
-  // once applied or dismissed.
+  // A picked city's IANA zone is *suggested*, not written: the operator may have
+  // deliberately set a different station clock.
   const [tzSuggestion, setTzSuggestion] = useState<string | null>(null);
   const handleGeocodePick = (r: GeocodeResult) => {
     const effective = form.timezone || data.serverTimezone || '';
     setTzSuggestion(r.timezone && r.timezone !== effective ? r.timezone : null);
   };
-  // A picked zone may not be one of TZ_GROUPS' items; Radix Select needs a
-  // matching <SelectItem> to render it, so the card adds a fallback item.
+  // Radix Select needs a matching <SelectItem> to render a value, so a picked zone
+  // outside TZ_GROUPS gets a fallback item.
   const tzInGroups = !form.timezone || TZ_GROUPS.some(g => g.zones.includes(form.timezone));
 
   return (
@@ -127,6 +123,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
             className="w-[260px] max-w-full"
             maxLength={80}
           />
+          <SettingsFieldError path="station" errors={fieldErrors} />
           <div className="field-hint">
             Substituted into the DJ prompt’s {'{station}'} placeholder (current: {data.values?.station || 'SUB/WAVE'}). Applies live.
           </div>
@@ -143,6 +140,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
             className="w-full"
             maxLength={200}
           />
+          <SettingsFieldError path="stationDescription" errors={fieldErrors} />
           <div className="field-hint">
             The blurb shown when someone shares a link to this station on social
             media or chat. Stays the same whoever is on air; leave it empty and
@@ -260,8 +258,7 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
               <SelectGroup>
                 <SelectItem value="auto">Auto, server timezone ({serverTz})</SelectItem>
               </SelectGroup>
-              {/* Fallback for a zone picked via the location search that isn't in
-                  the enumerated groups — Radix needs an item to show it. */}
+              {/* Radix needs an item to show a zone outside the enumerated groups. */}
               {!tzInGroups ? (
                 <SelectGroup>
                   <SelectItem value={form.timezone}>{form.timezone}</SelectItem>
@@ -546,6 +543,8 @@ export function StationSection({ data, form, setForm, busy, saveSettings }: Sect
         busy={busy}
         onSave={save}
         saveLabel="Save station settings"
+        errors={fieldErrors}
+        ownedKeys={['station', 'stationDescription', 'timezone', 'locale', 'weather', 'privacy', 'requests']}
       />
     </>
   );

@@ -1,10 +1,12 @@
 // Shared "right now" context-field vocabulary for the Skills admin (#471).
-// The skill edit/create sheet (SkillEditModal) renders these as a chip bank, so
-// the labels + fallback list + the comma-string parser live here, defined once.
+//
+// The vocabulary itself comes from the mirrored skill schema.
+import { CONTEXT_FIELDS, type ContextField } from '@/lib/schemas.generated';
 
-// Friendly labels for the context fields. Keys are the controller's
-// CONTEXT_FIELDS vocabulary; anything not listed falls back to the raw key.
-export const CONTEXT_FIELD_LABELS: Record<string, string> = {
+// Human labels for the chips. Typed as an EXHAUSTIVE record, so adding a field
+// to the controller's vocabulary fails the web build until it has a label
+// rather than silently rendering a raw key.
+export const CONTEXT_FIELD_LABELS: Record<ContextField, string> = {
   date: 'Date & season',
   clock: 'Clock time',
   time: 'Daypart',
@@ -14,10 +16,10 @@ export const CONTEXT_FIELD_LABELS: Record<string, string> = {
   listeners: 'Listener count',
 };
 
-// Fallback vocabulary if the controller doesn't send knownContextFields.
-export const CONTEXT_FIELDS_FALLBACK = ['date', 'clock', 'time', 'weather', 'festival', 'show', 'listeners'];
+// Used when the controller doesn't send knownContextFields (an older
+// controller, or a failed read) — the same list it would have sent.
+export const CONTEXT_FIELDS_FALLBACK: string[] = [...CONTEXT_FIELDS];
 
-// Split a comma-separated `context` value into trimmed, non-empty tokens.
 export function splitContext(s?: string): string[] {
   return typeof s === 'string' ? s.split(',').map(t => t.trim()).filter(Boolean) : [];
 }

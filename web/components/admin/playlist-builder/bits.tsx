@@ -1,26 +1,21 @@
 'use client';
 
-// Shared micro-pieces and the energy colour scale (design idiom: mono
-// eyebrows, sharp toggles).
-//
-// Part of the playlist-builder/ split - see ../PlaylistBuilderPanel.tsx.
+// Shared micro-pieces and the energy colour scale.
 
 import { useRef } from 'react';
 import { X } from 'lucide-react';
 import { useDynamicStyle } from '../../../hooks/useDynamicStyle';
-import { Switch } from '../../ui/switch';
 import { cn } from '../../../lib/cn';
 import { EN_HIGH, EN_HIGH_BG, EN_LOW, EN_LOW_BG, EN_MED, EN_MED_BG } from './types';
 
 export const energyColor = (e?: string | null): string => (e === 'low' ? EN_LOW : e === 'high' ? EN_HIGH : EN_MED);
 export const energyBgClass = (e?: string | null): string => (e === 'low' ? EN_LOW_BG : e === 'high' ? EN_HIGH_BG : EN_MED_BG);
-// Untagged tracks read '—', not a fake 'med' — an untagged library shouldn't
-// masquerade as uniformly mid-energy (the bars go translucent for the same reason).
+// Untagged tracks read '—', not a fake 'med': an untagged library must not
+// masquerade as uniformly mid-energy.
 export const energyLabel = (e?: string | null): string =>
   e === 'low' || e === 'medium' || e === 'high' ? (e === 'medium' ? 'med' : e) : '—';
 export const energyKnown = (e?: string | null): boolean => e === 'low' || e === 'medium' || e === 'high';
 
-// ── shared micro-pieces (design idiom: mono eyebrows, sharp toggles) ─────────
 
 export function Eyeb({ children, muted, className }: { children: React.ReactNode; muted?: boolean; className?: string }) {
   return (
@@ -82,8 +77,8 @@ export function Chip({ accent, onRemove, children }: { accent?: boolean; onRemov
   );
 }
 
-// ── Dual-anchor range — two overlaid native sliders sharing one track, with an
-// accent band between the anchors. No dependency; thumbs stay keyboardable.
+// Two overlaid native sliders sharing one track, with an accent band between the
+// anchors. No dependency; thumbs stay keyboardable.
 export function DualRange({ min, max, step, lo, hi, disabled, onLo, onHi, loLabel, hiLabel }: {
   min: number; max: number; step: number; lo: number; hi: number; disabled?: boolean;
   onLo: (v: number) => void; onHi: (v: number) => void; loLabel: string; hiLabel: string;
@@ -121,18 +116,5 @@ export function DualRange({ min, max, step, lo, hi, disabled, onLo, onHi, loLabe
   );
 }
 
-export function SwitchRow({ label, hint, on, onToggle, mutedLabel }: {
-  label: string; hint: string; on: boolean; onToggle: (v: boolean) => void; mutedLabel?: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <div>
-        <div className={cn('text-[13px] font-semibold', mutedLabel && 'text-muted')}>{label}</div>
-        <div className="font-mono text-[10px] text-muted">{hint}</div>
-      </div>
-      <Switch checked={on} onCheckedChange={onToggle} aria-label={label} />
-    </div>
-  );
-}
 
 

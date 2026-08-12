@@ -29,8 +29,13 @@ import {
   SHOW_FILTER_VALUES_MAX,
   SHOW_TOPIC_MAX,
   SOUL_MAX,
+  coerceShowVocals,
   type EraWindow,
 } from '../settings.js';
+// Caps come from the shared show schema, not local literals — a hardcoded 60
+// here silently diverged the moment SHOW_NAME_MAX became the one rule the
+// validator, the loader and the admin form all run.
+import { SHOW_NAME_MAX, SHOW_SEGMENT_SKILL_MAX, repairEraWindow } from '../schemas/show.js';
 
 // Slug rule shared by every community artifact — lowercase, starts alphanumeric,
 // then alphanumeric/hyphen, ≤49 chars. Anchored, so a slug can't carry a path
@@ -81,6 +86,8 @@ export interface CommunityShow {
   genres: string[];
   eras: EraWindow[];
   energies: string[];
+  /** '' = no constraint. See SHOW_VOCALS. */
+  vocals: string;
   filtersStrict: boolean;
   banter: boolean;
   programme: boolean;
@@ -93,7 +100,7 @@ export interface CommunityShow {
 
 // Stations are the public directory (a map of listeners' stations) — pass-through
 // JSON, shape-owned by web/lib/stations.ts. We keep them loose here.
-export type CommunityStation = Record<string, unknown> & { slug?: string };
+type CommunityStation = Record<string, unknown> & { slug?: string };
 
 interface Catalog {
   skills: CommunitySkill[];
@@ -204,13 +211,11 @@ function normalizeEras(v: unknown): EraWindow[] {
   if (!Array.isArray(v)) return [];
   const out: EraWindow[] = [];
   for (const w of v) {
-    if (!w || typeof w !== 'object') continue;
-    const r = w as { fromYear?: unknown; toYear?: unknown };
-    const from = Number.isInteger(r.fromYear) ? (r.fromYear as number) : null;
-    const to = Number.isInteger(r.toYear) ? (r.toYear as number) : null;
-    if (from == null && to == null) continue;
-    if (from != null && to != null && from > to) continue;
-    out.push({ fromYear: from, toYear: to });
+    // Window repair (year bounds, from<=to) is the schema's own repairEraWindow
+    // so a catalog era can't be judged by different rules than a saved one.
+    const win = repairEraWindow(w);
+    if (win == null) continue;
+    out.push(win);
     if (out.length >= 6) break;
   }
   return out;
@@ -219,7 +224,7 @@ function normalizeEras(v: unknown): EraWindow[] {
 function normalizeShow(raw: any): CommunityShow | null {
   const slug = str(raw?.slug);
   if (!SLUG_RE.test(slug)) return null;
-  const name = (str(raw?.name) || str(raw?.displayName)).slice(0, 60);
+  const name = (str(raw?.name) || str(raw?.displayName)).slice(0, SHOW_NAME_MAX);
   if (!name) return null;
   const seconds = Number(raw?.maxTrackSeconds);
   return {
@@ -232,10 +237,14 @@ function normalizeShow(raw: any): CommunityShow | null {
     genres: strList(raw?.genres, SHOW_FILTER_VALUES_MAX),
     eras: normalizeEras(raw?.eras),
     energies: strList(raw?.energies, SHOW_FILTER_VALUES_MAX).filter(e => (SHOW_ENERGY as string[]).includes(e)),
+    // Scalar, not a list — instrumental and vocal are mutually exclusive. Reuses
+    // the settings coercer so a catalog typo lands on '' (no constraint) here
+    // exactly as it does on a hand-edited show.
+    vocals: coerceShowVocals(raw),
     filtersStrict: raw?.filtersStrict === true,
     banter: raw?.banter === true,
     programme: raw?.programme === true,
-    segmentSkill: str(raw?.segmentSkill).slice(0, 64),
+    segmentSkill: str(raw?.segmentSkill).slice(0, SHOW_SEGMENT_SKILL_MAX),
     maxTrackSeconds: Number.isInteger(seconds) && seconds >= 0 ? seconds : null,
     submittedBy: optStr(raw?.submittedBy, 80),
     dateAdded: optStr(raw?.dateAdded, 10),
@@ -302,10 +311,6 @@ export async function communityPersonas(): Promise<CommunityPersona[]> {
 export async function communityShows(): Promise<CommunityShow[]> {
   return (await getCatalog()).shows;
 }
-export async function communityStations(): Promise<CommunityStation[]> {
-  return (await getCatalog()).stations;
-}
-
 export async function readCommunitySkill(slug: string): Promise<CommunitySkill | null> {
   if (!SLUG_RE.test(slug)) return null;
   return (await communitySkills()).find(s => s.slug === slug) ?? null;

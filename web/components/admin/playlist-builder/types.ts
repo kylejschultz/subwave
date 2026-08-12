@@ -1,19 +1,20 @@
 'use client';
 
 // Shapes, vocab and the small formatters the playlist builder shares.
-//
-// Part of the playlist-builder/ split - see ../PlaylistBuilderPanel.tsx.
 
+import { SHOW_ENERGY } from '@/lib/schemas.generated';
 
 export const API = (process.env.NEXT_PUBLIC_API_URL as string | undefined) || '/api';
 
-// Mirrors SHOW_MOODS in controller/src/settings.ts (stable vocab).
-export const MOODS = [
-  'energetic', 'calm', 'reflective', 'celebratory', 'romantic', 'spiritual',
-  'focus', 'workout', 'driving', 'cooking', 'rainy', 'sunny', 'night', 'morning',
-  'evening', 'festival', 'cultural',
-];
-export const ENERGIES = ['low', 'medium', 'high'];
+// There is deliberately NO mood list here: moods are operator-editable
+// (/admin/moods), so a hand-copied vocabulary was wrong twice over — a custom
+// mood was unpickable in the builder and a deleted mood was still offered. The
+// panel reads the live names off /settings (tts.moods) instead.
+//
+// Energy IS a fixed vocabulary, and its one home is the show schema — read out
+// of the flat mirror rather than re-declared (a mirrored module may not import
+// another one, but this file isn't mirrored; it just must not carry a copy).
+export const ENERGIES: readonly string[] = SHOW_ENERGY;
 export type ArcShape = 'flat' | 'build' | 'peak-then-cool' | 'wind-down';
 export const ARCS: { id: ArcShape; label: string; hint: string }[] = [
   { id: 'flat', label: 'Steady', hint: 'even energy throughout' },
@@ -30,9 +31,8 @@ export const BPM_STEP = 5;
 export const YEAR_MIN = 1950;                            // release year: 1950 → current year
 export const YEAR_MAX = new Date().getFullYear();
 
-// Bar palette for the energy graph — theme-aware mixes rather than the mock's
-// light-theme hexes, so dark mode keeps the same low/med/high contrast. Raw
-// values feed SVG `fill` attributes; the class twins style HTML swatches.
+// Theme-aware mixes, so dark mode keeps the same low/med/high contrast. Raw values
+// feed SVG `fill` attributes; the class twins style HTML swatches.
 export const EN_LOW = 'color-mix(in oklab, var(--ink) 22%, var(--bg))';
 export const EN_MED = 'color-mix(in oklab, var(--ink) 80%, var(--bg))';
 export const EN_HIGH = 'var(--accent)';
@@ -58,8 +58,8 @@ export interface DraftTrack {
 export interface SeedChip { id: string; title: string; artist: string }
 export interface PlaylistSummary { id: string; name: string; songCount: number; synced?: boolean; lastSyncedAt?: string | null }
 
-// Loose shape for /dj/search rows and /playlists/:id entries — the controller
-// returns Subsonic-derived fields with varying key names across endpoints.
+// Loose: the controller returns Subsonic-derived fields with varying key names
+// across endpoints.
 export interface RawTrackRow {
   id: string;
   title?: string;

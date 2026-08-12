@@ -1,11 +1,10 @@
 'use client';
-// Full-screen editor for the focused persona: identity, behaviour, voice and
-// skills cards plus the save bar. Binds the index-taking mutators down to the
-// focused persona so the cards stay index-agnostic. Rendered inside the shared
-// EditorDialog (edge-to-edge, centered column) — the roster is the browse view,
-// this is the edit surface.
+// Full-screen editor for the focused persona. `control`+`index` thread straight
+// down to the cards that bind real fields; `persona` stays as a read-only live
+// snapshot for display-only reads (title, share link, on-air/default pills).
 import type { RefObject } from 'react';
-import type { Persona, PersonaTts, SettingsResponse, SkillCatalogEntry } from './types';
+import type { Control } from 'react-hook-form';
+import type { Persona, PersonasFormValues, SettingsResponse, SkillCatalogEntry } from './types';
 import type { AdminAuth } from '../../../lib/adminAuth';
 import { Eyebrow, Pill } from '../ui';
 import { cn } from '../../../lib/cn';
@@ -20,6 +19,10 @@ import { PersonaSkillsCard } from './PersonaSkillsCard';
 interface PersonaEditorProps {
   persona: Persona;
   index: number;
+  // 1-based slot in the DISPLAYED roster, not in the form array — the header
+  // counter has to name the position the operator just clicked.
+  position: number;
+  control: Control<PersonasFormValues>;
   personaCount: number;
   activePersonaId: string;
   onAirPersonaId: string;
@@ -34,9 +37,9 @@ interface PersonaEditorProps {
   open: boolean;
   isNew: boolean;
   onClose: () => void;
-  setPersona: (i: number, patch: Partial<Persona>) => void;
-  setPersonaTts: (i: number, patch: Partial<PersonaTts>) => void;
-  setPersonaSkills: (i: number, skills: string[]) => void;
+  // The one remaining multi-field bulk patch (the AI-draft "apply") — every
+  // keystroke field is bound straight to `control` instead.
+  onUpdate: (i: number, patch: Partial<Persona>) => void;
   onUploadAvatar: (id: string, file: File) => void;
   onGenerateAvatar: (id: string) => void;
   onClearAvatar: (id: string) => void;
@@ -52,20 +55,16 @@ interface PersonaEditorProps {
 }
 
 export function PersonaEditor({
-  persona, index, personaCount, activePersonaId, onAirPersonaId, data, adminFetch, avatarTick, uploadingId,
+  persona, index, position, control, personaCount, activePersonaId, onAirPersonaId, data, adminFetch, avatarTick, uploadingId,
   defaultEngine, cloudIssueText, skillCatalog, editorRef, open, isNew, onClose,
-  setPersona, setPersonaTts, setPersonaSkills,
+  onUpdate,
   onUploadAvatar, onGenerateAvatar, onClearAvatar, onSetActive, onRemove,
   canSave, focusedOk, allPersonasOk, promptOk, busy, onSave, onDiscard,
 }: PersonaEditorProps) {
-  const update = (patch: Partial<Persona>) => setPersona(index, patch);
-  const updateTts = (patch: Partial<PersonaTts>) => setPersonaTts(index, patch);
-  const setSkills = (skills: string[]) => setPersonaSkills(index, skills);
+  const update = (patch: Partial<Persona>) => onUpdate(index, patch);
 
-  // Share this persona to the community: open the prefilled add-persona Issue
-  // Form on GitHub in a new tab. A workflow turns the issue into a one-file PR;
-  // once merged it ships to everyone as an installable community persona. Only
-  // the portable fields travel — voice and avatar stay station-side.
+  // Opens the prefilled add-persona Issue Form on GitHub. Only the portable fields
+  // travel — voice and avatar stay station-side.
   const shareToCommunity = () => {
     const slug = persona.name.trim().toLowerCase()
       .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 49);
@@ -91,11 +90,11 @@ export function PersonaEditor({
       onOpenChange={(o) => { if (!o) onClose(); }}
       title={<Eyebrow className="text-vermilion">{isNew ? 'New persona' : 'Edit persona'}</Eyebrow>}
       sub={(
-        // The dialog header holds `sub` in a flex-none cell, so `truncate` needs
-        // a width to bite — cap it on phones (a 40-char persona name would
-        // otherwise push the close button off the edge), unbounded on desktop.
+        // The dialog header holds `sub` in a flex-none cell, so `truncate` needs a
+        // width to bite: capped on phones (a 40-char name would push the close
+        // button off the edge), unbounded on desktop.
         <span className="caption block max-w-[42vw] truncate sm:max-w-none">
-          {persona.name.trim() || `Persona ${index + 1}`} · {index + 1} of {personaCount}
+          {persona.name.trim() || `Persona ${position}`} · {position} of {personaCount}
         </span>
       )}
       footer={
@@ -162,28 +161,31 @@ export function PersonaEditor({
       <div ref={editorRef} className="grid">
         <PersonaIdentityCard
           persona={persona}
+          index={index}
+          control={control}
           isNew={isNew}
           adminFetch={adminFetch}
           avatarTick={avatarTick}
           uploading={uploadingId === persona.id}
-          update={update}
+          onUpdate={update}
           onPickAvatar={(file) => onUploadAvatar(persona.id, file)}
           onGenerateAvatar={() => onGenerateAvatar(persona.id)}
           onClearAvatar={() => onClearAvatar(persona.id)}
         />
 
-        <PersonaBehaviorCard persona={persona} update={update} />
+        <PersonaBehaviorCard index={index} control={control} />
 
         <PersonaVoiceCard
           persona={persona}
+          index={index}
+          control={control}
           data={data}
           defaultEngine={defaultEngine}
           cloudIssueText={cloudIssueText}
           adminFetch={adminFetch}
-          updateTts={updateTts}
         />
 
-        <PersonaSkillsCard persona={persona} skillCatalog={skillCatalog} setSkills={setSkills} />
+        <PersonaSkillsCard index={index} control={control} skillCatalog={skillCatalog} />
       </div>
     </EditorDialog>
   );

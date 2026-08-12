@@ -1,18 +1,7 @@
 'use client';
 
-/* Admin Imaging page — the station's audio furniture, the sounds the DJ drops
-   between and over tracks. Three tabs:
-   - Jingles: pre-rendered TTS station stingers (+ the jingle-ratio frequency).
-   - SFX: effects the segment-director agent mixes under its voice.
-   - Beds: instrumentals the DJ talks over between songs (long-link beds).
-
-   These used to be three sections inside /admin/settings, but they're asset
-   management (create / upload / delete audio), not configuration — the same
-   category as Library / Shows / Personas / Skills. This panel owns the state
-   and handlers those sections need; the section components themselves moved
-   here from settings/ unchanged apart from imports (JinglesSection also lost
-   its FormState dependency — see its prop comment). Tab pattern mirrors
-   ConnectPanel (Seg control + ?tab= deep-link). */
+/* Owns the state and handlers the Jingles / SFX / Beds / Voices sections need.
+   Tab pattern mirrors ConnectPanel (Seg control + ?tab= deep-link). */
 
 import { useCallback, useEffect, useState } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
@@ -24,7 +13,9 @@ import { V3AlertDialog } from '../../ui/alert-dialog';
 import { SkeletonCards } from '@/components/ui/skeleton';
 import { ErrorState } from '@/components/ui/error-state';
 import type { SettingsData, SaveSettings } from '../settings/shared';
-import type { SfxData, SfxForm, BedsData, BedsForm, VoiceData, JingleImportFailure, JingleImportResult } from './types';
+import type {
+  SfxData, BedsData, VoiceData, JingleImportFailure, JingleImportResult, ImagingSubmitResult,
+} from './types';
 import { JinglesSection } from './JinglesSection';
 import { SfxSection } from './SfxSection';
 import { BedsSection } from './BedsSection';
@@ -43,29 +34,20 @@ export default function ImagingPanel() {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Active tab derived from the URL (?tab=…) — single source of truth shared by
-  // the in-page SectionTabs and the sidebar's Imaging submenu (both route
-  // through Next), so switching tabs while already on the page works.
+  // Active tab lives in the URL (?tab=…), shared by the in-page SectionTabs and the
+  // sidebar submenu, so switching tabs while already on the page works.
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const rawTab = searchParams.get('tab');
   const tab: TabId = (TAB_IDS as string[]).includes(rawTab ?? '') ? (rawTab as TabId) : 'jingles';
 
-  // Jingles: the create-text box + the lone settings field this page carries
-  // (the whole FormState stayed behind in SettingsPanel). null = not yet
-  // hydrated from /settings; polling never re-hydrates it, so operator edits
-  // to the ratio input survive the 3s refresh.
-  const [jingleText, setJingleText] = useState('');
+  // jingleRatio null = not yet hydrated from /settings; polling never re-hydrates it,
+  // so operator edits to the ratio input survive the 3s refresh.
   const [jingleRatio, setJingleRatio] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  // SFX
-  const [sfxForm, setSfxForm] = useState<SfxForm>({ name: '', description: '', prompt: '', durationSec: '' });
   const [confirmDeleteSfx, setConfirmDeleteSfx] = useState<string | null>(null);
-
-  // Beds
-  const [bedsForm, setBedsForm] = useState<BedsForm>({ name: '', description: '', prompt: '', durationSec: '' });
   const [confirmDeleteBed, setConfirmDeleteBed] = useState<string | null>(null);
   const [confirmDeleteVoice, setConfirmDeleteVoice] = useState<string | null>(null);
 
@@ -109,14 +91,11 @@ export default function ImagingPanel() {
     return () => clearInterval(id);
   }, [hydrated, needsAuth]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Hydrate the jingle-ratio input once, the first time /settings lands.
   useEffect(() => {
     if (data?.values && jingleRatio == null) setJingleRatio(String(data.values.jingleRatio ?? ''));
   }, [data, jingleRatio]);
 
-  // Deep-link: /admin/imaging?tab=sfx opens that tab directly (mirrors
-  // /admin/connect?tab=…). Routed through Next so a soft nav (in-page tab or
-  // sidebar submenu) re-derives `tab`.
+  // Routed through Next so a soft nav (in-page tab or sidebar submenu) re-derives `tab`.
   const selectTab = useCallback(
     (id: string) => {
       const params = new URLSearchParams(Array.from(searchParams.entries()));
@@ -134,10 +113,20 @@ export default function ImagingPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string; requiresRestart?: boolean };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
-      // The jingle-ratio change needs a mixer restart; the restart control
-      // lives in Settings → Danger zone (JinglesSection's hint points there).
+      const j = (await r.json().catch(() => ({}))) as {
+        error?: string;
+        fieldErrors?: Record<string, string>;
+        requiresRestart?: boolean;
+      };
+      // POST /settings answers with `fieldErrors` for the keys on the shared
+      // schema (#1348). These toggles are inline controls rather than a
+      // react-hook-form form, so there is no applyServerFieldErrors to call —
+      // the field message is simply the more specific of the two strings.
+      if (!r.ok) {
+        const field = Object.values(j.fieldErrors || {})[0];
+        throw new Error(field || j.error || `failed (${r.status})`);
+      }
+      // A jingle-ratio change needs a mixer restart (control in Settings → Danger zone).
       notify.ok(j.requiresRestart ? 'saved, restart the mixer to apply' : 'saved');
       await refresh();
       return true;
@@ -147,22 +136,30 @@ export default function ImagingPanel() {
     } finally { setBusy(false); }
   };
 
-  const createJingle = async (): Promise<boolean> => {
-    if (!jingleText.trim() || busy) return false;
+  // The create/import modals each own a react-hook-form instance validated
+  // against the matching schema in schemas.generated.ts (#1337's imaging
+  // schemas); these submitters do the actual round trip and hand back
+  // ImagingSubmitResult so the modal that owns the form can route a
+  // server-side refusal onto the right input via applyServerFieldErrors.
+  const createJingle = async (values: { text: string }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const r = await adminFetch('/jingles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: jingleText.trim() }),
+        body: JSON.stringify(values),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
-      setJingleText('');
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Jingle creation failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refresh();
-      return true;
-    } catch (e) { notify.err(`Jingle creation failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Jingle creation failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
   const deleteJingle = async (filename: string) => {
@@ -176,17 +173,14 @@ export default function ImagingPanel() {
     finally { setBusy(false); }
   };
 
-  // Multipart upload — adminFetch leaves Content-Type unset so the browser
-  // sets the multipart boundary itself. The controller transcodes + levels.
-  // Files upload one request at a time (not one multipart batch) so a big
-  // import doesn't hold 40+ files in memory at once server-side and a single
-  // bad file doesn't sink the rest. `label` only applies when importing a
-  // single file — each file in a batch defaults to its own filename. An
-  // abort via `signal` cancels the in-flight request too; the file it
-  // interrupted counts as skipped, not failed.
+  // adminFetch leaves Content-Type unset so the browser sets the multipart boundary.
+  // One request per file, not one batch: a 40-file import would otherwise sit in
+  // server memory at once and one bad file would sink the rest. `label` applies only
+  // to a single-file import (jingleImportSchema — already trimmed/capped by the
+  // time it gets here). An abort counts the interrupted file as skipped, not failed.
   const uploadJingle = async (
     files: File[],
-    label: string,
+    label: string | undefined,
     opts: { onProgress?: (done: number, total: number) => void; signal?: AbortSignal } = {},
   ): Promise<JingleImportResult | null> => {
     if (busy || !files.length) return null;
@@ -202,7 +196,7 @@ export default function ImagingPanel() {
         try {
           const fd = new FormData();
           fd.append('file', file);
-          if (total === 1 && label.trim()) fd.append('label', label.trim());
+          if (total === 1 && label) fd.append('label', label);
           const r = await adminFetch('/jingles/upload', { method: 'POST', body: fd, signal });
           const j = (await r.json().catch(() => ({}))) as { error?: string };
           if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
@@ -228,27 +222,27 @@ export default function ImagingPanel() {
     } finally { setBusy(false); }
   };
 
-  const createSfx = async (): Promise<boolean> => {
-    if (!sfxForm.name.trim() || !sfxForm.prompt.trim() || busy) return false;
+  const createSfx = async (values: {
+    name: string; description: string; prompt: string; durationSec?: number;
+  }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const r = await adminFetch('/sfx', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: sfxForm.name.trim(),
-          description: sfxForm.description.trim(),
-          prompt: sfxForm.prompt.trim(),
-          durationSec: sfxForm.durationSec ? parseFloat(sfxForm.durationSec) : undefined,
-        }),
+        body: JSON.stringify(values),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
-      setSfxForm({ name: '', description: '', prompt: '', durationSec: '' });
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Sound effect creation failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refreshSfx();
-      return true;
-    } catch (e) { notify.err(`Sound effect creation failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Sound effect creation failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
   const deleteSfx = async (name: string) => {
@@ -263,65 +257,74 @@ export default function ImagingPanel() {
   };
 
   // Upload a ready-made effect — no ElevenLabs key required (unlike createSfx).
-  const uploadSfx = async (file: File, name: string, description: string): Promise<boolean> => {
-    if (busy) return false;
+  // `values` is imagingImportSchema's output — already trimmed/capped.
+  const uploadSfx = async (file: File, values: { name: string; description: string }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('name', name.trim());
-      if (description.trim()) fd.append('description', description.trim());
+      fd.append('name', values.name);
+      if (values.description) fd.append('description', values.description);
       const r = await adminFetch('/sfx/upload', { method: 'POST', body: fd });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Sound effect import failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refreshSfx();
       notify.ok('sound effect imported');
-      return true;
-    } catch (e) { notify.err(`Sound effect import failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Sound effect import failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
   // Generate a bed via the ElevenLabs Music API — needs a key (unlike uploadBed).
-  const createBed = async (): Promise<boolean> => {
-    if (!bedsForm.name.trim() || !bedsForm.prompt.trim() || busy) return false;
+  const createBed = async (values: {
+    name: string; description: string; prompt: string; durationSec?: number;
+  }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const r = await adminFetch('/beds', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: bedsForm.name.trim(),
-          description: bedsForm.description.trim(),
-          prompt: bedsForm.prompt.trim(),
-          durationSec: bedsForm.durationSec ? parseFloat(bedsForm.durationSec) : undefined,
-        }),
+        body: JSON.stringify(values),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
-      setBedsForm({ name: '', description: '', prompt: '', durationSec: '' });
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Bed generation failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refreshBeds();
       notify.ok('bed generated');
-      return true;
-    } catch (e) { notify.err(`Bed generation failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Bed generation failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
-  const uploadBed = async (file: File, name: string, description: string): Promise<boolean> => {
-    if (busy) return false;
+  const uploadBed = async (file: File, values: { name: string; description: string }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('name', name.trim());
-      if (description.trim()) fd.append('description', description.trim());
+      fd.append('name', values.name);
+      if (values.description) fd.append('description', values.description);
       const r = await adminFetch('/beds/upload', { method: 'POST', body: fd });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Bed import failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refreshBeds();
       notify.ok('bed imported');
-      return true;
-    } catch (e) { notify.err(`Bed import failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Bed import failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
   const deleteBed = async (name: string) => {
@@ -337,23 +340,26 @@ export default function ImagingPanel() {
     finally { setBusy(false); }
   };
 
-  // Import a voice-clone reference clip. Any accepted audio type — the
-  // controller transcodes it to the canonical mono WAV.
-  const uploadVoice = async (file: File, name: string): Promise<boolean> => {
-    if (busy) return false;
+  // Any accepted audio type; the controller transcodes to the canonical mono WAV.
+  const uploadVoice = async (file: File, values: { name: string }): Promise<ImagingSubmitResult> => {
     setBusy(true);
     try {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('name', name.trim());
+      fd.append('name', values.name);
       const r = await adminFetch('/voices/upload', { method: 'POST', body: fd });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
+      const j = (await r.json().catch(() => ({}))) as { error?: string; fieldErrors?: Record<string, string> };
+      if (!r.ok) {
+        notify.err(`Voice import failed: ${j.error || `failed (${r.status})`}`);
+        return { ok: false, fieldErrors: j.fieldErrors };
+      }
       await refreshVoices();
       notify.ok('voice imported');
-      return true;
-    } catch (e) { notify.err(`Voice import failed: ${errorMessage(e)}`); return false; }
-    finally { setBusy(false); }
+      return { ok: true };
+    } catch (e) {
+      notify.err(`Voice import failed: ${errorMessage(e)}`);
+      return { ok: false };
+    } finally { setBusy(false); }
   };
 
   const deleteVoice = async (file: string) => {
@@ -369,8 +375,7 @@ export default function ImagingPanel() {
     finally { setBusy(false); }
   };
 
-  // Live counts ride on the tab badges + the masthead metrics. Undefined
-  // until each source loads; the badge is simply omitted until then.
+  // Undefined until each source loads; the badge is omitted until then.
   const jingleCount = data?.jingles?.length;
   const sfxCount = sfxData?.sfx?.length;
   const bedCount = bedsData?.beds?.length;
@@ -386,9 +391,6 @@ export default function ImagingPanel() {
 
   return (
     <div className="grid gap-4">
-      {/* Editorial masthead + tab row, on a lifted card surface so the header
-          reads as a card like the rest of the admin (Moods / Skills / Shows)
-          rather than floating on the page background. */}
       <section className="card">
       <header className="p-4 lg:p-5">
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
@@ -407,7 +409,7 @@ export default function ImagingPanel() {
               Everything your DJ slips between and over the music:{' '}
               <strong className="font-semibold text-ink">jingles</strong> are the station idents
               between tracks, <strong className="font-semibold text-ink">SFX</strong> are the little
-              stingers under the voice, and{' '}
+              stingers under the voice,{' '}
               <strong className="font-semibold text-ink">beds</strong> are instrumentals to talk
               over when a link runs long, and{' '}
               <strong className="font-semibold text-ink">voices</strong> are the clips your
@@ -421,8 +423,6 @@ export default function ImagingPanel() {
         </div>
       </header>
 
-      {/* Tab row — the shared editorial section-tabs, edge-to-edge along the
-          card's foot. */}
       <SectionTabs tabs={tabs} value={tab} onChange={selectTab} label="Imaging sections" />
       </section>
 
@@ -436,7 +436,6 @@ export default function ImagingPanel() {
             <JinglesSection
               data={data} busy={busy}
               jingleRatio={jingleRatio ?? ''} setJingleRatio={setJingleRatio}
-              jingleText={jingleText} setJingleText={setJingleText}
               createJingle={createJingle} uploadJingle={uploadJingle}
               saveSettings={saveSettings}
               onDelete={setConfirmDelete} adminFetch={adminFetch}
@@ -448,7 +447,7 @@ export default function ImagingPanel() {
 
         {tab === 'sfx' && (
           <SfxSection
-            sfxData={sfxData} sfxForm={sfxForm} setSfxForm={setSfxForm}
+            sfxData={sfxData}
             busy={busy} createSfx={createSfx} uploadSfx={uploadSfx}
             onDelete={setConfirmDeleteSfx}
             data={data} saveSettings={saveSettings} adminFetch={adminFetch}
@@ -457,7 +456,7 @@ export default function ImagingPanel() {
 
         {tab === 'beds' && (
           <BedsSection
-            bedsData={bedsData} bedsForm={bedsForm} setBedsForm={setBedsForm}
+            bedsData={bedsData}
             busy={busy} createBed={createBed} uploadBed={uploadBed}
             onDelete={setConfirmDeleteBed}
             data={data} saveSettings={saveSettings} adminFetch={adminFetch}

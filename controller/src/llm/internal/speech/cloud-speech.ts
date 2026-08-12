@@ -6,6 +6,7 @@
 // this only covers cloud voices — tts.js still owns the dispatch + fallback.
 
 import { generateSpeech } from 'ai';
+import type { FetchFunction } from '@ai-sdk/provider-utils';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createElevenLabs } from '@ai-sdk/elevenlabs';
 import { writeFile, mkdir } from 'node:fs/promises';
@@ -14,6 +15,7 @@ import crypto from 'node:crypto';
 import { config } from '../../../config.js';
 import * as settings from '../../../settings.js';
 import { transcodeAudio, hasFfmpeg } from '../../../audio/audio-import.js';
+import { compatParamsBody } from '../../../settings/compat-params.js';
 import { cloudExpressionCueFamily, isElevenLabsV3, snapV3Stability, soulBrief } from '../core/pure.js';
 import { FISH_DEFAULT_MODEL, synthesizeFish } from './fish-audio.js';
 
@@ -30,22 +32,22 @@ const CLOUD_DEFAULT_MODELS: Record<string, string> = {
 };
 
 // Pure resolution rule for the cloud TTS model a persona will be voiced by,
-// mirroring speak() below plus resolveEngine() in audio/tts.ts: the persona
-// owns the engine when set, otherwise the station defaultEngine speaks; a
-// persona that overrode the provider away from the global one falls back to
-// the new provider's default (openai-compatible has no default so it keeps
-// the global model); a persona voiced by the DEFAULT cloud engine carries no
-// provider override (speakWith only builds cloudOverride for an explicit
-// persona engine === 'cloud'). An unrecognised persona engine string fails
-// closed to '' — resolveEngine would route it to the defaultEngine, but a
-// missing hint is harmless while a wrong one is spoken aloud. Empty string =
-// not voiced by cloud / unresolved — callers treat that as "don't apply
-// model-specific hints". Kept pure and unit-pinned in scripts/llm-pure.test.ts
-// so the "mirror of speak()" claim is testable rather than comment-enforced.
-// Managed legacy inline keys and authenticated compatibility-server bearers
-// occupy separate slots. That provider scoping lets a compat persona keep its
-// credential when the station-wide Cloud provider differs without forwarding
-// an OpenAI/ElevenLabs secret to an arbitrary URL. Fish stays env/secrets-only.
+// mirroring speak() below plus resolveEngine() in audio/tts.ts: the persona owns
+// the engine when set, else the station defaultEngine speaks; a persona that
+// overrode the provider falls back to the new provider's default
+// (openai-compatible has none, so it keeps the global model); a persona voiced
+// by the DEFAULT cloud engine carries no provider override.
+//
+// An unrecognised persona engine fails CLOSED to '' — a missing hint is harmless
+// while a wrong one is spoken aloud. '' also means "not cloud / unresolved", so
+// callers apply no model-specific hints. Pure and unit-pinned in
+// scripts/llm-pure.test.ts, so the "mirror of speak()" claim is testable rather
+// than comment-enforced.
+//
+// Managed legacy inline keys and compatibility-server bearers occupy separate
+// slots, so a compat persona keeps its credential when the station-wide Cloud
+// provider differs, without forwarding an OpenAI/ElevenLabs secret to an
+// arbitrary URL. Fish stays env/secrets-only.
 export function sharedCloudApiKeyForRequest(
   provider: string,
   globalProvider: string,
@@ -235,6 +237,37 @@ function cloudCfg() {
   return settings.get().tts?.cloud || {};
 }
 
+// Merge the operator's extra body fields into the outgoing /audio/speech POST
+// (#1317). It has to happen at the FETCH layer: the AI SDK's OpenAI speech model
+// builds a CLOSED body, and its `providerOptions.openai` hatch is no use either
+// — the schema accepts only `instructions` + `speed`, and in @ai-sdk/openai
+// 4.0.11 the merge loop that would copy them iterates an empty object. Rewriting
+// the serialized body is the one hook that works short of forking the
+// provider.
+//
+// Everything here degrades to a pass-through rather than throwing: a param that
+// doesn't make it costs an un-tuned render, while an exception costs the whole
+// segment and drops the show to a local fallback voice. Extras are merged LAST
+// so the operator can also correct an SDK default (e.g. `response_format`);
+// the fields SUB/WAVE owns are reserved in settings/compat-params.ts.
+function compatBodyFetch(extras: Record<string, unknown>): FetchFunction | undefined {
+  if (!Object.keys(extras).length) return undefined;
+  return async (input, init) => {
+    const body = init?.body;
+    if (typeof body !== 'string') return fetch(input, init);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return fetch(input, init);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fetch(input, init);
+    // Re-stringify rather than patching the text: the body is small, and
+    // undici recomputes Content-Length for a string body on its own.
+    return fetch(input, { ...init, body: JSON.stringify({ ...parsed, ...extras }) });
+  };
+}
+
 function speechModel(c: any) {
   if (c.provider === 'elevenlabs') {
     const provider = createElevenLabs(c.apiKey ? { apiKey: c.apiKey } : {});
@@ -248,6 +281,9 @@ function speechModel(c: any) {
       baseURL: c.baseUrl,
       apiKey: c.apiKey || 'unused',
       name: 'openai-compatible',
+      // Undefined when the operator configured no extras, which keeps the
+      // request shape byte-identical to the pre-#1317 default station.
+      fetch: compatBodyFetch(compatParamsBody(c.compatParams)),
     });
     return provider.speech(c.model);
   }
@@ -328,13 +364,12 @@ export async function speak(
   // sent when it differs from default so default stations are unaffected and
   // providers that ignore the field never see it.
   //
-  // openai-compatible servers NEVER receive `speed` — their implementations
-  // are wildly uneven (issue #942: a Chatterbox shim behind LiteLLM produced
-  // comb-filtered "echo chamber" audio with broken mp3 frame timestamps
-  // whenever `speed` was present, and daypart energy makes it non-unity most
-  // of the day). Instead the server renders at its natural 1x and the rate is
-  // applied locally below via ffmpeg atempo — the slider/persona/daypart knobs
-  // still work (the point of #897), but the fragile server-side path is gone.
+  // openai-compatible servers NEVER receive `speed` — implementations are
+  // wildly uneven (#942: a Chatterbox shim behind LiteLLM produced comb-filtered
+  // "echo chamber" audio with broken mp3 frame timestamps whenever `speed` was
+  // present, and daypart energy makes it non-unity most of the day). The server
+  // renders at 1x and the rate is applied locally via ffmpeg atempo below, so
+  // every knob still works without the fragile server-side path.
   const isCompat = c.provider === 'openai-compatible';
   const speed = clampSpeed(config.tts.cloudSpeed * (speedScale != null ? speedScale : 1), c.provider);
   const stretchLocally = isCompat && speed !== 1.0;

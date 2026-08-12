@@ -1,10 +1,6 @@
-// Imaging-page-only types — the asset shapes returned by the controller's
-// /sfx and /beds routes, the SFX create-form, and the jingle bulk-import
-// result. These moved out of settings/shared.tsx when Jingles / SFX / Beds
-// left Settings for their own /admin/imaging page (they were never settings
-// data — they're the station's audio assets). The generic settings-save
-// primitives (SettingsData, SaveSettings, SectionHeader, PreviewButton) stay
-// in settings/shared.tsx; the imaging components still import those from there.
+// Asset shapes from the controller's /sfx and /beds routes. The generic
+// settings-save primitives (SettingsData, SaveSettings, SectionHeader,
+// PreviewButton) live in settings/shared.tsx, not here.
 
 export interface SfxEntry {
   name: string;
@@ -18,13 +14,6 @@ export interface SfxEntry {
 export interface SfxData {
   sfx?: SfxEntry[];
   generatorReady?: boolean;
-}
-
-export interface SfxForm {
-  name: string;
-  description: string;
-  prompt: string;
-  durationSec: string;
 }
 
 export interface BedEntry {
@@ -43,12 +32,12 @@ export interface BedsData {
   generatorReady?: boolean;
 }
 
-export interface BedsForm {
-  name: string;
-  description: string;
-  prompt: string;
-  durationSec: string;
-}
+// Every create/import submitter (ImagingPanel) answers this shape rather than
+// a bare boolean, so the modal that owns the react-hook-form instance can map
+// a server-side refusal back onto the right input via applyServerFieldErrors
+// — the same fieldErrors channel POST /settings' inline toggles deliberately
+// do NOT use (see ImagingPanel.tsx's saveSettings comment).
+export type ImagingSubmitResult = { ok: true } | { ok: false; fieldErrors?: Record<string, string> };
 
 export type JingleImportFailure = { name: string; reason: string };
 export type JingleImportResult = {

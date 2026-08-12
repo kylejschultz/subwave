@@ -19,11 +19,16 @@ import { cn } from '../../lib/cn';
 import ArchivesPanel from './ArchivesPanel';
 import BackupPanel from './BackupPanel';
 import {
+  SETTINGS_AAC_BITRATES,
+  SETTINGS_MP3_BITRATES,
+  SETTINGS_OPUS_BITRATES,
+} from '@/lib/schemas.generated';
+import {
   Radio, Palette, Cpu, Mic, Library, Search,
   Activity, Archive, Save, AlertTriangle, Heart, Music2,
 } from 'lucide-react';
 import {
-  SectionHeader, ELEVENLABS_VS_DEFAULTS, FISH_TTS_DEFAULTS,
+  SectionHeader, SettingsFieldError, ELEVENLABS_VS_DEFAULTS, FISH_TTS_DEFAULTS,
   type FormState, type FormUpdater, type SettingsData, type SaveSettings,
   type LoudnessSource, type LlmForm, type LlmFallbackForm,
 } from './settings/shared';
@@ -54,12 +59,39 @@ const SECTIONS = [
 
 type SectionId = (typeof SECTIONS)[number]['id'];
 
-// Keep in sync with MP3_BITRATES in controller/src/settings.ts — radio.liq
-// has a literal `%mp3(bitrate=…)` branch per value, so this set is fixed.
-const MP3_BITRATES = [64, 96, 128, 160, 192, 320] as const;
-// Keep in sync with OPUS_BITRATES / AAC_BITRATES in controller/src/settings.ts.
-const OPUS_BITRATES = [96, 128, 192, 256, 320] as const;
-const AAC_BITRATES = [128, 192, 256] as const;
+// The three encoder vocabularies, from the mirror rather than re-typed. radio.liq
+// has a literal `%mp3(bitrate=…)` branch per value, so each set is genuinely
+// fixed — but "fixed" is why a hand-copied list is dangerous rather than safe:
+// it drifts silently the one time a value IS added, offering the operator a
+// bitrate the schema then refuses (or hiding one it would have accepted).
+const MP3_BITRATES = SETTINGS_MP3_BITRATES;
+const OPUS_BITRATES = SETTINGS_OPUS_BITRATES;
+const AAC_BITRATES = SETTINGS_AAC_BITRATES;
+
+/**
+ * Replace exactly the errors belonging to the keys this patch carried.
+ *
+ * Scoped by TOP-LEVEL key, because that is the unit a save button posts and the
+ * unit the controller reports against: a `{beds: …}` save owns every
+ * `beds.*` error and nothing else. Merging blindly would let a fixed field keep
+ * showing its old message; clearing everything would wipe an unrelated
+ * section's unresolved error the moment any other control saved.
+ */
+function mergePatchErrors(
+  prev: Record<string, string>,
+  patch: Record<string, unknown>,
+  next: Record<string, string> | undefined,
+): Record<string, string> {
+  const owned = Object.keys(patch);
+  const isOwned = (path: string) =>
+    owned.some((key) => path === key || path.startsWith(`${key}.`));
+  const out: Record<string, string> = {};
+  for (const [path, message] of Object.entries(prev)) {
+    if (!isOwned(path)) out[path] = message;
+  }
+  for (const [path, message] of Object.entries(next || {})) out[path] = message;
+  return out;
+}
 
 export default function SettingsPanel() {
   const { adminFetch, needsAuth, hydrated } = useAdminAuth();
@@ -71,6 +103,7 @@ export default function SettingsPanel() {
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
   const [activeSection, setActiveSection] = useState<SectionId>('station');
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const router = useRouter();
 
   const refresh = async () => {
@@ -82,18 +115,11 @@ export default function SettingsPanel() {
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
   };
 
-  // Deep-link: /admin/settings?section=archives opens that rail directly. The
-  // old standalone /admin/{archives,backup} routes redirect here, so existing
-  // bookmarks keep working after the move into Settings. (Webhooks moved on to
-  // its own tab under /admin/connect?tab=webhooks.)
-  //
-  // Jingles / SFX / Beds left Settings for /admin/imaging — send their old
-  // ?section deep-links on to the matching tab so existing bookmarks survive.
-  //
-  // useSearchParams (not a one-shot window.location read) so client-side
-  // navigations to ?section=… land too — the NavidromeBanner links here from
-  // every admin page INCLUDING /admin/settings itself, where the panel is
-  // already mounted and only the query changes.
+  // Jingles / SFX / Beds now live on /admin/imaging; their old ?section
+  // deep-links are forwarded so existing bookmarks survive. Read through
+  // useSearchParams, not a one-shot window.location, so client-side navigations
+  // land too — NavidromeBanner links here from /admin/settings itself, where
+  // only the query changes.
   const searchParams = useSearchParams();
   useEffect(() => {
     const s = searchParams.get('section');
@@ -170,6 +196,13 @@ export default function SettingsPanel() {
         // controller's own coercion in settings.load().
         enabled: v.tts?.enabled !== false,
         defaultEngine: v.tts?.defaultEngine ?? 'piper',
+        // Absent block = off, matching the controller's normalizeTtsFallback().
+        fallback: {
+          enabled: v.tts?.fallback?.enabled === true,
+          engine: v.tts?.fallback?.engine ?? 'piper',
+          voice: v.tts?.fallback?.voice ?? '',
+          cloudProvider: v.tts?.fallback?.cloudProvider ?? 'openai',
+        },
         kokoro: { voice: v.tts?.kokoro?.voice ?? 'bf_isabella' },
         chatterbox: { referenceVoice: v.tts?.chatterbox?.referenceVoice ?? '' },
         pocketTts: { voice: v.tts?.pocketTts?.voice ?? 'alba' },
@@ -190,10 +223,15 @@ export default function SettingsPanel() {
             : v.tts?.cloud?.latency === 'balanced'
               ? 'balanced'
               : FISH_TTS_DEFAULTS.latency,
+          // Extra openai-compatible body fields (issue #1317). Rows are text
+          // pairs on the wire too — the controller coerces them to JSON types
+          // at send time, so the form never has to guess a value's shape.
+          compatParams: Array.isArray(v.tts?.cloud?.compatParams)
+            ? v.tts.cloud.compatParams.map(p => ({ key: String(p?.key ?? ''), value: String(p?.value ?? '') }))
+            : [],
         },
         remote: { url: v.tts?.remote?.url ?? '' },
-        // Per-engine voice level (dB). Zero default for all 6 engine ids, then
-        // overlay any saved values. Keyed by engine id — `pocket-tts` (hyphen).
+        // Per-engine voice level (dB), keyed by engine id — `pocket-tts` (hyphen).
         gainDb: {
           piper: 0,
           kokoro: 0,
@@ -203,8 +241,7 @@ export default function SettingsPanel() {
           remote: 0,
           ...(v.tts?.gainDb || {}),
         },
-        // Per-engine speech speed (×). Unity default for all 6, then overlay
-        // any saved values. Keyed by engine id — `pocket-tts` (hyphen).
+        // Per-engine speech speed (×), keyed by engine id — `pocket-tts` (hyphen).
         speed: {
           piper: 1,
           kokoro: 1,
@@ -214,7 +251,6 @@ export default function SettingsPanel() {
           remote: 1,
           ...(v.tts?.speed || {}),
         },
-        // Operator speech corrections — hydrate to clean {from, to} rows.
         corrections: (v.tts?.corrections || []).map(c => ({ from: c.from ?? '', to: c.to ?? '' })),
       },
       llm: {
@@ -223,9 +259,8 @@ export default function SettingsPanel() {
         ollamaUrl: v.llm?.ollamaUrl ?? '',
         numCtx: typeof v.llm?.numCtx === 'number' ? v.llm.numCtx : 16384,
         repeatPenalty: typeof v.llm?.repeatPenalty === 'number' ? v.llm.repeatPenalty : 1.15,
-        // Per-provider base URLs. Migrate from legacy single baseUrl on first load:
-        // if the server has already stored providerBaseUrls use that; otherwise seed
-        // the current provider's slot from the old baseUrl field so no URL is lost.
+        // Stored providerBaseUrls win; otherwise the legacy single baseUrl seeds
+        // the current provider's slot so no URL is lost.
         providerBaseUrls: (() => {
           const llmAny = v.llm as (Partial<LlmForm> & { baseUrl?: string; providerBaseUrls?: Record<string, string> }) | undefined;
           const stored = llmAny?.providerBaseUrls;
@@ -237,7 +272,11 @@ export default function SettingsPanel() {
         reasoning: !!v.llm?.reasoning,
         toolChoice: v.llm?.toolChoice === 'auto' ? 'auto' : 'required',
         pickerAgent: !!v.llm?.pickerAgent,
-        noRepeatWindow: String(typeof v.llm?.noRepeatWindow === 'number' ? v.llm.noRepeatWindow : 100),
+        // Fallback must track the controller's default (config.ts, 250): a
+        // settings.json written before the field existed omits the key, and
+        // seeding the OLD default here means opening Settings and saving any
+        // LLM field silently persists it over the new one.
+        noRepeatWindow: String(typeof v.llm?.noRepeatWindow === 'number' ? v.llm.noRepeatWindow : 250),
         requestWebResolve: !!v.llm?.requestWebResolve,
         agentTimeoutMs: typeof v.llm?.agentTimeoutMs === 'number' ? v.llm.agentTimeoutMs : 45000,
         pauseWhenEmpty: !!v.llm?.pauseWhenEmpty,
@@ -245,6 +284,7 @@ export default function SettingsPanel() {
         budgetSoftPct: typeof v.llm?.budgetSoftPct === 'number' ? v.llm.budgetSoftPct : 80,
         exemptRequests: v.llm?.exemptRequests !== false,
         maxOutputTokens: typeof v.llm?.maxOutputTokens === 'number' ? v.llm.maxOutputTokens : 0,
+        discoverySteps: typeof v.llm?.discoverySteps === 'number' ? v.llm.discoverySteps : 0,
         fallback: {
           enabled: !!v.llm?.fallback?.enabled,
           provider: v.llm?.fallback?.provider ?? 'ollama',
@@ -252,6 +292,7 @@ export default function SettingsPanel() {
           ollamaUrl: v.llm?.fallback?.ollamaUrl ?? '',
           numCtx: typeof v.llm?.fallback?.numCtx === 'number' ? v.llm.fallback.numCtx : 16384,
           repeatPenalty: typeof v.llm?.fallback?.repeatPenalty === 'number' ? v.llm.fallback.repeatPenalty : 1.15,
+          discoverySteps: typeof v.llm?.fallback?.discoverySteps === 'number' ? v.llm.fallback.discoverySteps : 0,
           providerBaseUrls: (() => {
             const fbAny = v.llm?.fallback as (LlmFallbackForm & { baseUrl?: string; providerBaseUrls?: Record<string, string> }) | undefined;
             const stored = fbAny?.providerBaseUrls;
@@ -278,8 +319,7 @@ export default function SettingsPanel() {
           const stored = (v.embedding as { providerBaseUrls?: Record<string, string> })?.providerBaseUrls;
           if (stored && typeof stored === 'object') return { ...stored };
           // Legacy migration keys by the EFFECTIVE provider (own, else the chat
-          // provider — the embedding leg inherits it when its own is empty), the
-          // same key LibrarySection reads and writes.
+          // provider), the same key LibrarySection reads and writes.
           const legacy = v.embedding?.baseUrl ?? '';
           const prov = v.embedding?.provider || v.llm?.provider || '';
           return legacy && prov ? { [prov]: legacy } : {};
@@ -338,8 +378,24 @@ export default function SettingsPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string; requiresRestart?: boolean };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
+      const j = (await r.json().catch(() => ({}))) as {
+        error?: string;
+        requiresRestart?: boolean;
+        fieldErrors?: Record<string, string>;
+      };
+      if (!r.ok) {
+        // Land the failure on the inputs it belongs to. The toast still fires —
+        // a save button can be off-screen from the control that failed — but
+        // the operator now also sees WHICH field, without decoding a dotted
+        // path out of a sentence.
+        //
+        // Only the keys THIS patch carried are replaced, so a stale error from
+        // an unrelated section can't linger and a section that saved cleanly
+        // can't be blamed for another's failure.
+        setFieldErrors((prev) => mergePatchErrors(prev, patch, j.fieldErrors));
+        throw new Error(j.error || `failed (${r.status})`);
+      }
+      setFieldErrors((prev) => mergePatchErrors(prev, patch, undefined));
       if (j.requiresRestart) setPendingRestart(true);
       notify.ok(j.requiresRestart ? 'saved, restart the mixer to apply' : 'saved');
       await refresh();
@@ -391,7 +447,6 @@ export default function SettingsPanel() {
 
   return (
     <div className="stack-mobile grid grid-cols-[240px_1fr] items-start gap-6">
-      {/* Section rail */}
       <aside className="grid gap-1 sm:sticky sm:top-6">
         <span className="caption pb-2">settings</span>
         {SECTIONS.map(s => {
@@ -420,7 +475,6 @@ export default function SettingsPanel() {
         })}
       </aside>
 
-      {/* Active section */}
       <div className="grid gap-4">
         {err && <ErrorState error={err} onRetry={refresh} />}
         {pendingRestart && (
@@ -455,31 +509,31 @@ export default function SettingsPanel() {
             {activeSection === 'tts' && data.tts && (
               <TtsSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} adminFetch={adminFetch} refresh={refresh}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
             )}
             {activeSection === 'llm' && data.llm && (
               <LlmSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} adminFetch={adminFetch} refresh={refresh}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
             )}
             {activeSection === 'search' && (
               <SearchSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} adminFetch={adminFetch}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch}
               />
             )}
             {activeSection === 'library' && (
               <LibrarySection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} adminFetch={adminFetch} refresh={refresh}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
             )}
             {activeSection === 'station' && (
               <StationSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings}
+                saveSettings={saveSettings} fieldErrors={fieldErrors}
               />
             )}
             {activeSection === 'music' && (
@@ -487,20 +541,20 @@ export default function SettingsPanel() {
             )}
             {activeSection === 'theme' && (
               <ThemeSection
-                data={data} busy={busy} saveSettings={saveSettings}
+                data={data} busy={busy} saveSettings={saveSettings} fieldErrors={fieldErrors}
                 adminFetch={adminFetch}
               />
             )}
             {activeSection === 'scrobble' && (
               <ScrobbleSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} adminFetch={adminFetch} refresh={refresh}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
             )}
             {activeSection === 'likes' && (
               <LikesSection
                 data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings}
+                saveSettings={saveSettings} fieldErrors={fieldErrors}
               />
             )}
           </>
@@ -542,6 +596,7 @@ export default function SettingsPanel() {
                         Save
                       </Btn>
                     </div>
+                    <SettingsFieldError path="archive.enabled" errors={fieldErrors} />
                     <div className="field-hint">
                       The archive runs a second MP3 encoder 24/7 and is the biggest constant
                       CPU cost in the broadcast container. Turn it off if you don't replay
@@ -764,6 +819,7 @@ export default function SettingsPanel() {
                       Save crossfade
                     </Btn>
                   </div>
+                  <SettingsFieldError path="crossfadeDuration" errors={fieldErrors} />
                   <div className="field-hint">
                     Seconds of overlap between tracks (current: {data?.values?.crossfadeDuration}s).
                     Saving flags a pending restart. Apply it with the Mixer card below.
@@ -844,9 +900,8 @@ export default function SettingsPanel() {
                       />
                       <span className="text-sm opacity-70">
                         GB &middot; holds ~
-                        {/* /25 mirrors the controller's stem-cache APPROX_TRACK_BYTES ceiling;
-                            /13 the field-measured average (#1257) — the real figure lands
-                            between, and the doctor sizes off the cache's own average. */}
+                        {/* /25 mirrors the controller's stem-cache APPROX_TRACK_BYTES
+                            ceiling, /13 the field-measured average (#1257). */}
                         {Math.floor(
                           ((Number(form.transitions.stemCacheGb) || 15) * 1024) / 25,
                         ).toLocaleString('en-GB')}
@@ -856,10 +911,8 @@ export default function SettingsPanel() {
                         ).toLocaleString('en-GB')}{' '}
                         tracks
                       </span>
-                      {/* Every editable field on this page carries its own save button;
-                          without one here operators edit the number, miss the card-level
-                          "Save transitions" two fields below, and the change silently
-                          reverts on the next visit. */}
+                      {/* Its own save button: without one, an edit here misses the
+                          card-level "Save transitions" and silently reverts. */}
                       <Btn
                         sm
                         onClick={() =>
@@ -957,6 +1010,7 @@ export default function SettingsPanel() {
                       Save limit
                     </Btn>
                   </div>
+                  <SettingsFieldError path="maxTrackSeconds" errors={fieldErrors} />
                   <div className="field-hint">
                     The DJ won&rsquo;t auto-pick tracks longer than this, handy for hour-long
                     album mixes or DJ sets that keep landing in rotation. Listener requests still
@@ -1108,6 +1162,7 @@ export default function SettingsPanel() {
                         Save
                       </Btn>
                     </div>
+                    <SettingsFieldError path="stream.opusEnabled" errors={fieldErrors} />
                     <div className="field-hint">
                       Off by default. Only Chrome/Edge listeners ever pick Opus (Safari, iOS and
                       Firefox stay on the universal MP3 mount); for them it&apos;s equal-or-better
@@ -1152,6 +1207,7 @@ export default function SettingsPanel() {
                         Save bitrate
                       </Btn>
                     </div>
+                    <SettingsFieldError path="stream.opusBitrate" errors={fieldErrors} />
                     <div className="field-hint">
                       96 kbps is transparent for most music; 256/320 suits hifi listeners
                       (current: {data?.values?.stream?.opusBitrate ?? '—'} kbps). Raising it
@@ -1193,6 +1249,7 @@ export default function SettingsPanel() {
                       Save
                     </Btn>
                   </div>
+                  <SettingsFieldError path="stream.flacEnabled" errors={fieldErrors} />
                   {form.stream.flacEnabled && (
                     <div className="field-hint">
                       Point a player at{' '}
@@ -1246,6 +1303,7 @@ export default function SettingsPanel() {
                       Save
                     </Btn>
                   </div>
+                  <SettingsFieldError path="stream.oggIcyMetadata" errors={fieldErrors} />
                   <div className="field-hint">
                     On by default. Sends each track&apos;s title out-of-band (ICY) on the Opus and
                     FLAC mounts, which most internet-radio players and Cast receivers need: they
@@ -1290,6 +1348,7 @@ export default function SettingsPanel() {
                         Save
                       </Btn>
                     </div>
+                    <SettingsFieldError path="stream.aacEnabled" errors={fieldErrors} />
                     {form.stream.aacEnabled && (
                       <div className="field-hint">
                         Point a player at{' '}
@@ -1341,6 +1400,7 @@ export default function SettingsPanel() {
                         Save bitrate
                       </Btn>
                     </div>
+                    <SettingsFieldError path="stream.aacBitrate" errors={fieldErrors} />
                     <div className="field-hint">
                       AAC-LC is transparent around 256 kbps (current:{' '}
                       {data?.values?.stream?.aacBitrate ?? '—'} kbps).
@@ -1387,6 +1447,7 @@ export default function SettingsPanel() {
                       Save bitrate
                     </Btn>
                   </div>
+                  <SettingsFieldError path="stream.bitrate" errors={fieldErrors} />
                   <div className="field-hint">
                     Higher bitrate = better quality, more listener bandwidth
                     (current: {data?.values?.stream?.bitrate ?? '—'} kbps). 192 kbps is the

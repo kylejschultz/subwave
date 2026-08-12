@@ -1,14 +1,18 @@
-// Pure show helpers: hydrating a stored/partial show into a fully-defaulted
-// one, validating it, and projecting it to the payload and table-row shapes.
-// hydrateShow is the single place the legacy singular -> plural coercion (#929)
-// lives, so the initial load and a community install can't drift apart.
+// Pure show helpers: hydration and the payload / table-row projections.
 //
-// Part of the shows/ split - see ../ShowsPanel.tsx (mirrors schedule/lib.ts).
+// Validation lives in ShowsPanel/ShowEditor, which run the shared show schema
+// through zodResolver. What stays local is only what that schema deliberately
+// does not express: the editor's tolerance for a half-finished show
+// (hydrateShow), and showPayload's "only means something with" conditionals.
 
 import type { ShowFacet, ShowRow } from './ShowsTable';
 import { SHOW_COLORS } from '../schedule/lib';
-import { NAME_MAX, TOPIC_MAX, eraLabelOf } from './types';
+import { eraLabelOf } from './types';
 import type { Persona, Schedule, Show } from './types';
+import {
+  migrateLegacyShowFields,
+  type ShowSchemaContext,
+} from '@/lib/schemas.generated';
 
 
 export function clientMintId() {
@@ -16,34 +20,39 @@ export function clientMintId() {
   return 's_' + [...b].map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
-// Hydrate a raw/partial show (from GET /settings or a community install
-// response) into a fully-defaulted Show. Kept in one place so the initial load
-// and the community install share the exact same legacy-field coercion (#929).
+// Fill in a show the editor can hold.
+//
+// Deliberately NOT a schema parse: the editor must be able to carry a
+// half-finished show (a fresh one has no name and no host yet), and a parse
+// would reject exactly that. What it does take from the schema is the legacy
+// singular → plural coercion (#929) — migrateLegacyShowFields — so the browser
+// and the controller's load path can't disagree about what an old `mood` or a
+// comma-crammed `genre` becomes.
 export function hydrateShow(s: Partial<Show>): Show {
+  const m = migrateLegacyShowFields(s) as Partial<Show>;
   return {
-    id: s.id ?? clientMintId(),
-    name: s.name ?? '',
-    topic: s.topic ?? '',
-    personaId: s.personaId ?? '',
-    guestPersonaIds: Array.isArray(s.guestPersonaIds) ? s.guestPersonaIds : [],
-    banter: s.banter ?? false,
-    // Plural lists are canonical (#929); a legacy singular field from a stale
-    // response still hydrates as a one-element list.
-    moods: Array.isArray(s.moods) ? s.moods : (s as { mood?: string }).mood ? [(s as { mood?: string }).mood!] : [],
-    themeId: s.themeId ?? '',
-    genres: Array.isArray(s.genres) ? s.genres : (s as { genre?: string }).genre ? [(s as { genre?: string }).genre!] : [],
-    eras: Array.isArray(s.eras) ? s.eras : (() => {
-      const { fromYear = null, toYear = null } = s as { fromYear?: number | null; toYear?: number | null };
-      return fromYear != null || toYear != null ? [{ fromYear, toYear }] : [];
-    })(),
-    energies: Array.isArray(s.energies) ? s.energies : (s as { energy?: string }).energy ? [(s as { energy?: string }).energy!] : [],
-    filtersStrict: s.filtersStrict ?? false,
-    maxTrackSeconds: s.maxTrackSeconds ?? null,
-    playlistIds: Array.isArray(s.playlistIds) ? s.playlistIds : [],
-    playlistStrict: s.playlistStrict ?? false,
-    excludedPlaylistIds: Array.isArray(s.excludedPlaylistIds) ? s.excludedPlaylistIds : [],
-    programme: s.programme ?? false,
-    segmentSkill: s.segmentSkill ?? '',
+    id: m.id ?? clientMintId(),
+    name: m.name ?? '',
+    topic: m.topic ?? '',
+    personaId: m.personaId ?? '',
+    guestPersonaIds: Array.isArray(m.guestPersonaIds) ? m.guestPersonaIds : [],
+    banter: m.banter ?? false,
+    moods: Array.isArray(m.moods) ? m.moods : [],
+    themeId: m.themeId ?? '',
+    genres: Array.isArray(m.genres) ? m.genres.map(g => String(g).trim()).filter(Boolean) : [],
+    eras: Array.isArray(m.eras) ? m.eras : [],
+    energies: Array.isArray(m.energies) ? m.energies : [],
+    // Anything unrecognised reads as no constraint, matching the schema's own
+    // vocals field — a steering filter that silently stops applying is a far
+    // smaller failure than a show that stops playing music.
+    vocals: m.vocals === 'instrumental' || m.vocals === 'vocal' ? m.vocals : '',
+    filtersStrict: m.filtersStrict ?? false,
+    maxTrackSeconds: m.maxTrackSeconds ?? null,
+    playlistIds: Array.isArray(m.playlistIds) ? m.playlistIds : [],
+    playlistStrict: m.playlistStrict ?? false,
+    excludedPlaylistIds: Array.isArray(m.excludedPlaylistIds) ? m.excludedPlaylistIds : [],
+    programme: m.programme ?? false,
+    segmentSkill: m.segmentSkill ?? '',
   };
 }
 
@@ -59,21 +68,35 @@ export function abbrev(name: string): string {
   return name.trim().slice(0, 2).toUpperCase();
 }
 
-export function showValid(s: Show): boolean {
-  // mood is deliberately not required — '' means "Any" (autonomous mood).
-  return s.name.trim().length >= 1 && s.name.trim().length <= NAME_MAX
-    && !!s.personaId && s.topic.trim().length <= TOPIC_MAX;
+/**
+ * The show schema's context, from what the panel already has loaded.
+ *
+ * Every field is a real check here — unlike the controller's LOAD path, the
+ * panel holds the live roster, the live mood vocabulary and the live theme
+ * list, so it can answer all four questions the server will ask.
+ */
+export function showContext(opts: {
+  personas: Persona[];
+  moods: string[];
+  themeIds: string[];
+  minTrackSeconds: number | null;
+}): ShowSchemaContext {
+  return {
+    personaIds: opts.personas.map(p => p.id),
+    moodNames: opts.moods,
+    themeIds: opts.themeIds,
+    minTrackSeconds: opts.minTrackSeconds,
+  };
 }
 
 // At least one music filter set — the Strict filter toggle only means
 // something when there's a filter for it to harden.
 export function hasAnyMusicFilter(s: Show): boolean {
-  return !!(s.moods.length || s.genres.length || s.energies.length || s.eras.length);
+  return !!(s.moods.length || s.genres.length || s.energies.length || s.eras.length || s.vocals);
 }
 
-// The wire shape for one show — trimmed + the "only-means-something-with"
-// conditionals the server also enforces. Shared by the editor's Save show
-// (POST /shows) and the community install path so they stay identical.
+// Trimmed, with the "only-means-something-with" conditionals the server also
+// enforces. Shared by Save show (POST /shows) and the community install path.
 export function showPayload(s: Show) {
   return {
     id: s.id,
@@ -90,6 +113,7 @@ export function showPayload(s: Show) {
     genres: s.genres.map(g => g.trim()).filter(Boolean),
     eras: s.eras,
     energies: s.energies,
+    vocals: s.vocals || '',
     // Strict only means something with at least one music filter set.
     filtersStrict: hasAnyMusicFilter(s) && s.filtersStrict,
     maxTrackSeconds: s.maxTrackSeconds,
@@ -104,10 +128,8 @@ export function showPayload(s: Show) {
 }
 
 
-// "What it plays" facets — moods, genres, eras, energies as chips, plus the
-// hard-lock / playlist / length flags. The visual counterpart to the text
-// showFilterSummary() the strip cards still use. Shared by the slate card and
-// the table row so the two views can't drift.
+// The visual counterpart to the text showFilterSummary(). Shared by the slate card
+// and the table row so the two views can't drift.
 export function showFacets(s: Show): ShowFacet[] {
   const facets: ShowFacet[] = [];
   if (s.moods.length) s.moods.forEach(m => facets.push({ key: `mood-${m}`, label: m }));
@@ -115,6 +137,7 @@ export function showFacets(s: Show): ShowFacet[] {
   s.genres.forEach(g => facets.push({ key: `genre-${g}`, label: g }));
   s.eras.forEach((e, idx) => facets.push({ key: `era-${idx}`, label: eraLabelOf(e) }));
   s.energies.forEach(en => facets.push({ key: `energy-${en}`, label: en }));
+  if (s.vocals) facets.push({ key: 'vocals', label: s.vocals === 'instrumental' ? 'instrumental' : 'vocals' });
   if (s.filtersStrict && hasAnyMusicFilter(s)) facets.push({ key: 'strict', label: 'strict', accent: true });
   const nPl = s.playlistIds?.length ?? 0;
   if (nPl) facets.push({ key: 'playlists', label: `${nPl} playlist${nPl > 1 ? 's' : ''}${s.playlistStrict ? ' · strict' : ''}` });
@@ -132,9 +155,8 @@ export function joinNames(names: string[]): string {
   return `${names.slice(0, -1).join(', ')} & ${names[names.length - 1]}`;
 }
 
-// A persona as a table face — resolved avatar URL plus the initials to fall
-// back to. `index` is carried on the row because the panel keys colour and
-// editing off the show's position in the array.
+// `index` is carried on the row because the panel keys colour and editing off the
+// show's position in the array.
 function faceOf(p: Persona, apiBase: string) {
   return {
     key: p.id,
@@ -143,9 +165,18 @@ function faceOf(p: Persona, apiBase: string) {
   };
 }
 
-// Flatten one show into the table's view-model. Everything the row needs is
-// derived here, so ShowsTable never has to know the `Show` shape.
-export function showRow(s: Show, index: number, personas: Persona[], apiBase: string, hrs: number): ShowRow {
+// Everything the row needs is derived here, so ShowsTable never sees `Show`.
+// `ok` is supplied by the caller (ShowsPanel), sourced from the RHF form's own
+// `formState.errors.shows` — the schema's answer, not a local reimplementation
+// of it. Same convention PersonaRoster/PersonaTable already established.
+export function showRow(
+  s: Show,
+  index: number,
+  personas: Persona[],
+  apiBase: string,
+  hrs: number,
+  ok: boolean,
+): ShowRow {
   const host = personas.find(p => p.id === s.personaId) ?? null;
   const guests = (s.guestPersonaIds || [])
     .map(id => personas.find(p => p.id === id))
@@ -164,7 +195,7 @@ export function showRow(s: Show, index: number, personas: Persona[], apiBase: st
     guestNames: joinNames(guests.map(g => g.name?.trim() || 'Unnamed')),
     facets: showFacets(s),
     hrs,
-    ok: showValid(s),
+    ok,
   };
 }
 

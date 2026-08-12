@@ -1,7 +1,7 @@
 'use client';
 
-// Listener likes (#991) — the heart button's operator controls: on/off, the
-// Navidrome star write-back, and whether the leaderboard steers the AI DJ.
+// Listener likes (#991): on/off, the Navidrome star write-back, and whether the
+// leaderboard steers the AI DJ.
 
 import type { ChangeEvent } from 'react';
 import { Input } from '../../ui/input';
@@ -9,7 +9,7 @@ import { Label } from '../../ui/label';
 import { Card, Pill, Seg } from '../ui';
 import { SectionHeader, SaveBar, type SectionProps, type LikesForm } from './shared';
 
-export function LikesSection({ data, form, setForm, busy, saveSettings }: SectionProps) {
+export function LikesSection({ data, form, setForm, busy, saveSettings, fieldErrors }: SectionProps) {
   const lk = form.likes;
   const saved = data.values?.likes || {};
 
@@ -145,6 +145,8 @@ export function LikesSection({ data, form, setForm, busy, saveSettings }: Sectio
           busy={busy}
           onSave={save}
           saveLabel="Save likes"
+          errors={fieldErrors}
+          ownedKeys={['likes']}
         />
       </Card>
     </>

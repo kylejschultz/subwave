@@ -10,7 +10,7 @@
 // single poisoned show bricked every show create/edit, schedule edit, and full
 // restore with `shows[N].themeId "sunset" is not a known theme id`. The theme
 // system already tolerates stale ids everywhere else (the lenient load path and
-// serve-time getTheme() fall back to the station default), so strict validation
+// serve-time GET /themes fall back to the station default), so strict validation
 // must DROP an unknown id to "" rather than throw. It must NOT weaken any other
 // strictness, and must never discard a valid (still-known) pick.
 //
@@ -84,14 +84,14 @@ const allowed = new Set(['classic-light', 'vinyl', 'blueprint']);
 // A dangling persona reference is still a hard error.
 assert.throws(
   () => validateShowsStrict([{ name: 'Bad', personaId: 'p_nope' }], personas, allowed),
-  /personaId must reference an existing persona/,
+  /personaId.*must reference an existing persona/,
   'unknown personaId still throws',
 );
 
 // A blank name is still a hard error (proves the theme fix did not blanket-soften).
 assert.throws(
   () => validateShowsStrict([{ name: '', personaId: 'p_host' }], personas, allowed),
-  /name must be 1-60 chars/,
+  /name.*must be 1-60 chars/,
   'invalid name still throws',
 );
 

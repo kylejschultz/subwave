@@ -34,7 +34,7 @@ const searchProviderLabel = (id: string | undefined): string =>
 interface SearchSectionProps extends SectionProps {
   adminFetch: (path: string, init?: RequestInit) => Promise<Response>;
 }
-export function SearchSection({ data, form, setForm, busy, saveSettings, adminFetch }: SearchSectionProps) {
+export function SearchSection({ data, form, setForm, busy, saveSettings, adminFetch, fieldErrors }: SearchSectionProps) {
   const [keyTest, setKeyTest] = useState<{ ok: boolean; message: string; latencyMs: number } | null>(null);
   const [keyTesting, setKeyTesting] = useState(false);
   const [testingSearxng, setTestingSearxng] = useState(false);
@@ -61,8 +61,8 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
   const save = () => saveSettings({
     search: {
       provider: form.search.provider,
-      // Don't echo back 'set' — that's the redaction sentinel from getRedacted().
-      // The controller's update() ignores it, but skipping it keeps the patch tidy.
+      // 'set' is getRedacted()'s redaction sentinel; update() ignores it anyway, but
+      // skipping it keeps the patch tidy.
       ...(form.search.apiKey && form.search.apiKey !== 'set'
         ? { apiKey: form.search.apiKey }
         : {}),
@@ -146,8 +146,8 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
             <Select
               value={provider}
               onValueChange={v => {
-                // A key-test verdict is per-provider — don't let a green
-                // "Tavily key valid" linger after switching to Brave.
+                // A key-test verdict is per-provider: don't let a green "Tavily key
+                // valid" linger after switching to Brave.
                 setKeyTest(null);
                 setForm(f => ({ ...f, search: { ...f.search, provider: v } }));
               }}
@@ -250,6 +250,8 @@ export function SearchSection({ data, form, setForm, busy, saveSettings, adminFe
         busy={busy}
         onSave={save}
         saveLabel="Save web search"
+        errors={fieldErrors}
+        ownedKeys={['search']}
       />
     </>
   );

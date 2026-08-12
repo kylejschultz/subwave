@@ -1,17 +1,11 @@
 'use client';
 
-// Stations — /admin/stations, "transmitter rack" design (Stations.dc.html
-// from the Claude Design project, re-expressed in house Tailwind tokens).
-// An FM dial band shows every station as a carrier with the live one as the
-// needle; below it the rack lists stations as numbered presets. Create and
-// rename run in modals; make-live and delete sit behind danger confirms.
-// Installs are capped at MAX_STATIONS=8 server-side (GET /stations `limit`).
-//
-// Activating a station — or creating the SECOND station, which converts a
-// single-station install — restarts the controller, so both flows funnel
-// into one full-screen "re-tuning" state that hard-reloads once /state
-// reports the new station booted (boot-frozen station.id — see
-// controller/src/routes/public.ts). API: controller/src/routes/stations.ts.
+// Stations rack. Installs are capped at MAX_STATIONS=8 server-side (GET
+// /stations `limit`). Activating a station — or creating the SECOND station,
+// which converts a single-station install — restarts the controller, so both
+// flows funnel into one full-screen "re-tuning" state that hard-reloads once
+// /state reports the new station booted (boot-frozen station.id).
+// API: controller/src/routes/stations.ts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAdminAuth } from '../../lib/adminAuth';
@@ -19,10 +13,17 @@ import { CONVERT_SENTINEL, useStationSwitchPoll } from '../../hooks/useStationSw
 import { useDynamicStyle } from '../../hooks/useDynamicStyle';
 import { notify, errorMessage } from '../../lib/notify';
 import { cn } from '../../lib/cn';
+import { useZodForm, applyServerFieldErrors, fieldAria } from '@/lib/form';
+import {
+  slugifyStationName,
+  stationCreateSchema,
+  stationRenameSchema,
+  type StationCreateMode,
+} from '@/lib/schemas.generated';
 import { Plus } from 'lucide-react';
 import { Btn } from './ui';
 import { Input } from '../ui/input';
-import { Label } from '../ui/label';
+import { Field, FieldLabel, FieldDescription, FieldError } from '@/components/ui/field';
 import { Modal } from '../ui/modal';
 import { V3AlertDialog } from '../ui/alert-dialog';
 import styles from './StationsPanel.module.css';
@@ -42,19 +43,8 @@ interface StationsResponse {
   stations: StationRow[];
 }
 
-// Mirrors slugifyStationName in controller/src/stations/pure.ts — preview
-// only; the server's answer is authoritative (collisions get -2 suffixes).
-function slugPreview(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 41)
-    .replace(/-+$/g, '');
-}
-
-// Each station gets a stable pseudo-frequency on the 88–108 FM band, hashed
-// from its id so it keeps its spot as the rack changes. Pure presentation.
+// A stable pseudo-frequency on the 88–108 FM band, hashed from the station id
+// so it keeps its spot as the rack changes. Pure presentation.
 function assignFrequencies(stations: StationRow[]): Map<string, number> {
   const taken = new Set<number>();
   const out = new Map<string, number>();
@@ -126,10 +116,23 @@ export default function StationsPanel() {
   const [busy, setBusy] = useState(false);
   const [confirm, setConfirm] = useState<{ type: 'live' | 'del'; s: StationRow } | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
-  const [createName, setCreateName] = useState('');
-  const [createMode, setCreateMode] = useState<'fresh' | 'duplicate'>('fresh');
   const [renaming, setRenaming] = useState<StationRow | null>(null);
-  const [renameValue, setRenameValue] = useState('');
+  // Both dialogs validate against the SAME schemas the controller enforces, so
+  // an over-long or empty name is refused under the input before a request is
+  // sent — and the messages match the ones a 400 would carry.
+  const createForm = useZodForm(stationCreateSchema, { name: '', mode: 'fresh' });
+  const renameForm = useZodForm(stationRenameSchema, { name: '' });
+  const createName = createForm.watch('name');
+  // `mode` is optional in z.input because the schema defaults it — the ?? just
+  // restates that default, since every reset() below sets it explicitly.
+  const createMode = createForm.watch('mode') ?? 'fresh';
+  const setCreateMode = (mode: StationCreateMode) =>
+    createForm.setValue('mode', mode, { shouldValidate: true, shouldDirty: true });
+  const createErrors = createForm.formState.errors;
+  const renameErrors = renameForm.formState.errors;
+  const createNameAria = fieldAria('station-name', createErrors.name, { hasDescription: true });
+  const createModeAria = fieldAria('station-mode', createErrors.mode);
+  const renameAria = fieldAria('station-rename', renameErrors.name);
   // Non-null while a switch is in flight: the target station id, or the
   // CONVERT_SENTINEL for a fresh-install → multi-station conversion.
   const [switching, setSwitching] = useState<string | null>(null);
@@ -158,15 +161,19 @@ export default function StationsPanel() {
   const limit = data?.limit ?? 8;
   const atCap = stations.length >= limit;
 
-  const create = async () => {
+  const create = createForm.handleSubmit(async (values) => {
     setBusy(true);
     try {
       const r = await adminFetch('/stations', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: createName, mode: createMode }),
+        body: JSON.stringify(values),
       });
-      const j = (await r.json().catch(() => ({}))) as { switching?: boolean; error?: string };
+      const j = (await r.json().catch(() => ({}))) as {
+        switching?: boolean;
+        error?: string;
+        fieldErrors?: Record<string, string>;
+      };
       if (!r.ok) {
         // Converted-but-create-failed wedge: the conversion is durable and the
         // controller restarts regardless — enter the re-tuning state anyway.
@@ -179,11 +186,15 @@ export default function StationsPanel() {
           setSwitching(CONVERT_SENTINEL);
           return;
         }
+        // "no active station to duplicate from" is a rule only the server can
+        // check — it reads the live pointer off disk — so it comes back keyed
+        // to `mode` and lands under the Fresh/Duplicate picker, where the fix
+        // (choose Fresh) actually is.
+        applyServerFieldErrors(createForm, j.fieldErrors);
         throw new Error(j.error || `failed (${r.status})`);
       }
       setCreateOpen(false);
-      setCreateName('');
-      setCreateMode('fresh');
+      createForm.reset({ name: '', mode: 'fresh' });
       if (j.switching) {
         notify.info('Converting to multi-station — the controller is restarting.');
         setSwitchingLabel('converting install to multi-station');
@@ -197,7 +208,7 @@ export default function StationsPanel() {
     } finally {
       setBusy(false);
     }
-  };
+  });
 
   const activate = async (s: StationRow) => {
     if (!s.id) return;
@@ -230,18 +241,25 @@ export default function StationsPanel() {
     }
   };
 
-  const rename = async () => {
+  const rename = renameForm.handleSubmit(async (values) => {
     if (!renaming?.id) return;
     setBusy(true);
     try {
       const r = await adminFetch(`/stations/${renaming.id}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: renameValue }),
+        body: JSON.stringify(values),
       });
-      const j = (await r.json().catch(() => ({}))) as { error?: string };
-      if (!r.ok) throw new Error(j.error || `failed (${r.status})`);
-      notify.ok(`Renamed to “${renameValue.trim()}”.`);
+      const j = (await r.json().catch(() => ({}))) as {
+        error?: string;
+        fieldErrors?: Record<string, string>;
+      };
+      if (!r.ok) {
+        applyServerFieldErrors(renameForm, j.fieldErrors);
+        throw new Error(j.error || `failed (${r.status})`);
+      }
+      // The schema trimmed it, so this is the name the card actually carries.
+      notify.ok(`Renamed to “${values.name}”.`);
       setRenaming(null);
       await load();
     } catch (e) {
@@ -249,12 +267,12 @@ export default function StationsPanel() {
     } finally {
       setBusy(false);
     }
-  };
+  });
 
   if (!hydrated || needsAuth) return null;
 
-  // A switch is in flight — the re-tuning screen replaces everything until
-  // the new controller answers and the page reloads itself.
+  // The re-tuning screen replaces everything until the new controller answers
+  // and the page reloads itself.
   if (switching) {
     return (
       <div className="fixed inset-0 z-[100] grid place-items-center bg-[var(--bg)]">
@@ -287,7 +305,6 @@ export default function StationsPanel() {
 
   return (
     <div className="grid gap-4">
-      {/* Header + dial card */}
       <section className="card">
       <header className="p-5">
         <div className="font-mono text-[10px] font-bold tracking-[0.22em] text-vermilion uppercase">
@@ -311,8 +328,7 @@ export default function StationsPanel() {
               lg
               disabled={busy || loading || atCap}
               onClick={() => {
-                setCreateName('');
-                setCreateMode('fresh');
+                createForm.reset({ name: '', mode: 'fresh' });
                 setCreateOpen(true);
               }}
             >
@@ -327,7 +343,6 @@ export default function StationsPanel() {
         </p>
       </header>
 
-      {/* FM dial band */}
       {data ? (
         <div className="border-t border-ink px-5 pt-4 pb-3">
           <div className="relative h-[88px] border-y border-ink bg-field">
@@ -355,9 +370,7 @@ export default function StationsPanel() {
       ) : null}
       </section>
 
-      {/* Rack card: loading / error / rows */}
       <section className="card">
-      {/* Loading skeleton */}
       {loading ? (
         <div>
           {[0, 1, 2].map(k => (
@@ -379,7 +392,6 @@ export default function StationsPanel() {
         </div>
       ) : null}
 
-      {/* Load error */}
       {err && !data ? (
         <div className="grid justify-items-start gap-2.5 px-9 py-9">
           <div className="font-mono text-[10px] font-bold tracking-[0.22em] text-vermilion uppercase">
@@ -400,17 +412,14 @@ export default function StationsPanel() {
         </div>
       ) : null}
 
-      {/* The rack */}
       {data ? (
         <div>
           {stations.map((s, i) => (
             <div
               key={s.id ?? '__install'}
-              /* Phone: two columns (preset tile + identity) with the action
-                 cluster dropped onto its own full-width row underneath — a
-                 96px tile, two 24px gaps and three buttons leave the name
-                 column barely 100px wide at 390. Restored to the single
-                 three-column rack row from sm: up. */
+              /* Phone: preset tile + identity, with the action cluster on its
+                 own row — a 96px tile, two 24px gaps and three buttons leave
+                 the name column barely 100px wide at 390. */
               className="grid grid-cols-[96px_minmax(0,1fr)] items-center gap-x-4 border-t border-separator-strong first:border-t-0 sm:grid-cols-[96px_1fr_auto] sm:gap-6"
             >
               <div
@@ -498,7 +507,7 @@ export default function StationsPanel() {
                       disabled={busy}
                       onClick={() => {
                         setRenaming(s);
-                        setRenameValue(s.name);
+                        renameForm.reset({ name: s.name });
                       }}
                     >
                       Rename
@@ -521,7 +530,6 @@ export default function StationsPanel() {
         </div>
       ) : null}
 
-      {/* Single-station note */}
       {data && singleMode ? (
         <div className="border-t border-separator-strong px-4 py-4 text-[13px] leading-relaxed text-muted">
           This install hasn&apos;t been converted to multi-station yet — it runs exactly this one
@@ -531,7 +539,6 @@ export default function StationsPanel() {
       ) : null}
       </section>
 
-      {/* Create modal */}
       <Modal
         open={createOpen}
         onOpenChange={o => {
@@ -545,7 +552,7 @@ export default function StationsPanel() {
             <Btn onClick={() => setCreateOpen(false)}>Cancel</Btn>
             <Btn
               tone="accent"
-              disabled={busy || !createName.trim() || atCap}
+              disabled={busy || !createForm.formState.isValid || atCap}
               onClick={() => void create()}
             >
               {busy ? 'Creating…' : singleMode ? 'Create & convert' : 'Create station'}
@@ -565,25 +572,46 @@ export default function StationsPanel() {
               </p>
             </div>
           ) : null}
-          <div className="grid gap-1.5">
-            <Label htmlFor="station-name">Station name</Label>
+          <Field data-invalid={createNameAria.invalid}>
+            <FieldLabel {...createNameAria.labelProps}>Station name</FieldLabel>
             <Input
-              id="station-name"
-              value={createName}
+              {...createForm.register('name')}
+              {...createNameAria.controlProps}
               autoFocus
               placeholder="e.g. Night Loop"
-              onChange={e => setCreateName(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter' && createName.trim() && !busy && !atCap) void create();
+                if (e.key === 'Enter' && !busy && !atCap) void create();
               }}
             />
-            <div className="font-mono text-[10px] tracking-[0.1em] text-muted lowercase">
-              slug: {slugPreview(createName) || '—'}
-            </div>
-          </div>
-          <div className="grid gap-2">
-            <Label>Starting point</Label>
-            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+            {/* The exact function the server slugifies with, out of the shared
+                schema — this used to be a hand-copied reimplementation that had
+                already dropped the "nothing usable" fallback, so a name like
+                "!!!" previewed blank and then arrived as /station. */}
+            <FieldDescription
+              {...createNameAria.descriptionProps}
+              className="font-mono text-[10px] tracking-[0.1em] text-muted lowercase"
+            >
+              slug: {createName.trim() ? slugifyStationName(createName) : '—'}
+            </FieldDescription>
+            <FieldError
+              {...createNameAria.errorProps}
+              errors={createErrors.name ? [createErrors.name] : undefined}
+            />
+          </Field>
+
+          {/* No single labelable control, so the Field names the group itself
+              rather than pointing htmlFor at a <div>. The buttons are real
+              radios, so the group they belong to has to say so — role="radio"
+              outside a radiogroup is an orphan to a screen reader. */}
+          <Field data-invalid={createModeAria.invalid}>
+            <FieldLabel asChild {...createModeAria.labelledByProps}>
+              <span>Starting point</span>
+            </FieldLabel>
+            <div
+              role="radiogroup"
+              {...createModeAria.groupProps}
+              className="grid grid-cols-1 gap-2.5 sm:grid-cols-2"
+            >
               {(
                 [
                   {
@@ -625,16 +653,19 @@ export default function StationsPanel() {
                 </button>
               ))}
             </div>
+            <FieldError
+              {...createModeAria.errorProps}
+              errors={createErrors.mode ? [createErrors.mode] : undefined}
+            />
             <div className="text-xs leading-normal text-muted">
               {singleMode
                 ? 'Fresh runs onboarding when first made live. Either way, creating a second station converts this install — see the warning above.'
                 : 'Fresh starts empty and runs the onboarding wizard the first time it goes live. Duplicate copies everything except play history and logs.'}
             </div>
-          </div>
+          </Field>
         </div>
       </Modal>
 
-      {/* Rename modal */}
       <Modal
         open={renaming !== null}
         onOpenChange={o => {
@@ -646,23 +677,33 @@ export default function StationsPanel() {
         footer={
           <div className="flex justify-end gap-2">
             <Btn onClick={() => setRenaming(null)}>Cancel</Btn>
-            <Btn tone="accent" disabled={busy || !renameValue.trim()} onClick={() => void rename()}>
+            <Btn
+              tone="accent"
+              disabled={busy || !renameForm.formState.isValid}
+              onClick={() => void rename()}
+            >
               Save
             </Btn>
           </div>
         }
       >
-        <Input
-          value={renameValue}
-          autoFocus
-          onChange={e => setRenameValue(e.target.value)}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && renameValue.trim() && !busy) void rename();
-          }}
-        />
+        <Field data-invalid={renameAria.invalid}>
+          <FieldLabel className="sr-only" {...renameAria.labelProps}>Station name</FieldLabel>
+          <Input
+            {...renameForm.register('name')}
+            {...renameAria.controlProps}
+            autoFocus
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !busy) void rename();
+            }}
+          />
+          <FieldError
+            {...renameAria.errorProps}
+            errors={renameErrors.name ? [renameErrors.name] : undefined}
+          />
+        </Field>
       </Modal>
 
-      {/* Make-live / delete confirms */}
       <V3AlertDialog
         open={confirm !== null}
         onOpenChange={o => {

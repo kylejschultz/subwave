@@ -1,82 +1,95 @@
-// Shapes and caps the shows panel and its editor share. The caps mirror the
-// controller's own limits in settings.ts - keep them in lockstep.
+// Shapes the shows panel and its editor share.
 //
-// Part of the shows/ split - see ../ShowsPanel.tsx.
+// Every cap below re-exports the shared show schema's own constant under a
+// local name, so nothing here can drift from the controller.
 
+import {
+  EXCLUDED_PLAYLISTS_PER_SHOW,
+  GUESTS_PER_SHOW,
+  PLAYLISTS_PER_SHOW,
+  SHOWS_LIMIT,
+  SHOW_ENERGY,
+  SHOW_FILTER_VALUES_MAX,
+  SHOW_NAME_MAX,
+  SHOW_TOPIC_MAX,
+  SHOW_VOCALS,
+} from '@/lib/schemas.generated';
 
-export const NAME_MAX = 60;
-// Mirrors the controller's SHOW_TOPIC_MAX (settings/vocab.ts).
-export const TOPIC_MAX = 2000;
-export const SHOWS_MAX = 64;
-// Mirrors the controller's GUESTS_PER_SHOW cap (settings.ts).
-export const GUESTS_MAX = 3;
+export const NAME_MAX = SHOW_NAME_MAX;
+export const TOPIC_MAX = SHOW_TOPIC_MAX;
+export const SHOWS_MAX = SHOWS_LIMIT;
+export const GUESTS_MAX = GUESTS_PER_SHOW;
+export const PLAYLISTS_MAX = PLAYLISTS_PER_SHOW;
+// Deliberately separate from PLAYLISTS_MAX: the same figure today, but one name
+// covering both is how they would silently stop being.
+export const EXCLUDED_PLAYLISTS_MAX = EXCLUDED_PLAYLISTS_PER_SHOW;
+
+/** How much the panel knows about the live Navidrome playlist index.
+ *
+ * Three states, not a loaded/not-loaded boolean: an empty `playlists` array
+ * means something different in each, and only `ready` licenses the editor to
+ * call a show's pinned id missing. A boolean collapses `loading` and `error`
+ * into one bucket, and whichever way that bucket renders is wrong for the other
+ * half of it — a spinner that never resolves, or a "no playlists" line shown
+ * while the fetch is still in flight. */
+export type PlaylistIndexStatus = 'loading' | 'ready' | 'error';
 
 export interface Show {
   id: string;
   name: string;
   topic: string;
   personaId: string;
-  /** Guest co-host persona ids (max 3, host excluded). While the show is on
-   *  air the speaker rotation hands some standalone talk breaks (station IDs,
-   *  hourly checks, weather/news segments) to a guest, in their own voice.
-   *  Empty = solo show, exactly today's behaviour. */
+  /** Guest co-host persona ids (max 3, host excluded). Empty = solo show. */
   guestPersonaIds: string[];
-  /** Scripted banter breaks: short multi-voice exchanges between the host and
-   *  guests, aired up to twice an hour. Only meaningful with guests set. */
+  /** Multi-voice exchanges, up to twice an hour. Only meaningful with guests set. */
   banter: boolean;
   /** [] = Any — the show pins no mood; the autonomous mood (festival >
    *  weather > time of day) applies while it's on air. Multi-value (#929):
    *  any selected mood satisfies the filter, all weighted equally. */
   moods: string[];
-  /** Optional theme override — empty string means "fall back to the station
-   *  default while this show is on air". Validated against the live theme
+  /** Empty = fall back to the station default. Validated against the live theme
    *  registry by the controller; a stale id silently falls back too. */
   themeId: string;
-  /** Optional music-steering filters — soft leans applied at pick time, each a
-   *  multi-value list (#929): OR within the attribute, AND across attributes.
-   *  Empty list means "no constraint". Genres are free text resolved fuzzily
-   *  against the library; eras are decade/year windows; energies come from
-   *  low|medium|high. */
+  /** Soft leans applied at pick time, each multi-value (#929): OR within the
+   *  attribute, AND across attributes. Empty = no constraint. Genres are free text
+   *  resolved fuzzily against the library. */
   genres: string[];
   eras: EraWindow[];
   energies: string[];
-  /** When true (and ≥1 music filter is set) EVERY set filter — mood, genre,
-   *  era, energy — becomes a HARD filter on the pick pool instead of a soft
-   *  lean; off-filter tracks only play as a last resort to avoid silence.
-   *  Defaults off. (Replaces the genre-only `genreStrict`; the controller does
-   *  NOT auto-migrate legacy strict shows — they load soft, opt back in here.) */
+  /** Single-valued, unlike the lists above: the two states are mutually
+   *  exclusive. '' = no constraint, and is what every show predating the field
+   *  carries. Backed by vocal-activity analysis, so it only steers tracks that
+   *  have had a vocal pass. */
+  vocals: '' | 'instrumental' | 'vocal';
+  /** With ≥1 music filter set, EVERY set filter becomes HARD instead of a soft
+   *  lean; off-filter tracks only play as a last resort. The controller does NOT
+   *  auto-migrate legacy `genreStrict` shows — they load soft. */
   filtersStrict: boolean;
   /** Per-show track-length cap (seconds). null = inherit the station default;
    *  0 = unlimited (opt this show out of the cap so it can air long mixes);
    *  >0 = this show's own cap. */
   maxTrackSeconds: number | null;
-  /** Navidrome playlist anchor — the union of these playlists becomes the show's
-   *  candidate pool. Empty = no anchor (behaves as before). */
+  /** The union of these playlists becomes the show's candidate pool. Empty = no anchor. */
   playlistIds: string[];
-  /** When true (and ≥1 playlist is pinned) the playlist is the show's ENTIRE
-   *  universe; off-playlist tracks only play as a never-starve fallback. When
-   *  false, the playlist just dominates the pool. Defaults off. */
+  /** With ≥1 playlist pinned, the playlist is the show's ENTIRE universe;
+   *  off-playlist tracks only play as a never-starve fallback. */
   playlistStrict: boolean;
-  /** Navidrome playlist blocklist — tracks from these playlists are excluded
-   *  from the candidate pool regardless of other filters. Empty = no exclusions. */
+  /** Excluded from the candidate pool regardless of the other filters. */
   excludedPlaylistIds: string[];
-  /** Programme mode: the show airs as a produced episode — intro at the top,
-   *  a planned feature segment mid-hour, a sign-off in the final minutes —
-   *  all driven by the topic brief via a per-episode producer plan. */
+  /** The show airs as a produced episode: intro, a planned feature segment
+   *  mid-hour, a sign-off, all driven by the topic brief. */
   programme: boolean;
-  /** Optional: pin the feature segment to one skill (e.g. news for a morning
-   *  roundup). Empty = the producer picks per episode. Only used with
-   *  programme on. */
+  /** Pin the feature segment to one skill. Empty = the producer picks per episode.
+   *  Only used with programme on. */
   segmentSkill: string;
 }
 
-/** One era window (mirrors the controller's EraWindow). Multiple windows let a
- *  show span non-adjacent decades ("90s + 2010s"). */
+/** Mirrors the controller's EraWindow. Multiple windows let a show span
+ *  non-adjacent decades ("90s + 2010s"). */
 export interface EraWindow { fromYear: number | null; toYear: number | null }
 
-// One entry in the shipped community show catalog (GET /shows/community). A
-// portable, persona-agnostic show definition: no owner, no schedule — Install
-// drops it in as a fresh unscheduled show owned by the active persona.
+// One entry of GET /shows/community: persona-agnostic, no owner and no schedule.
+// Install drops it in as a fresh unscheduled show owned by the active persona.
 export interface CommunityShow {
   slug: string;
   name: string;
@@ -95,7 +108,7 @@ export interface CommunityShow {
   dateModified?: string;  // ISO date (YYYY-MM-DD) of the last catalog change
 }
 
-// Decade presets for the era chips → one EraWindow each. Empty selection = any era.
+// One EraWindow each. Empty selection = any era.
 export const DECADES: { key: string; label: string; from: number; to: number }[] = [
   { key: '2020', label: '2020s', from: 2020, to: 2029 },
   { key: '2010', label: '2010s', from: 2010, to: 2019 },
@@ -106,14 +119,16 @@ export const DECADES: { key: string; label: string; from: number; to: number }[]
   { key: '1960', label: '60s', from: 1960, to: 1969 },
   { key: '1950', label: '50s', from: 1950, to: 1959 },
 ];
-export const ENERGY_OPTIONS = ['low', 'medium', 'high'];
+export const ENERGY_OPTIONS: readonly string[] = SHOW_ENERGY;
+// '' is the absent third state and deliberately has no chip — clearing the
+// selection is how you get back to it. Labels are UI copy ("vocals" reads
+// better as a chip than the schema's "vocal"), so only the KEYS come from the
+// schema; a value added there without a label here shows its raw key rather
+// than vanishing.
+const VOCAL_LABELS: Record<string, string> = { instrumental: 'instrumental', vocal: 'vocals' };
+export const VOCAL_OPTIONS = SHOW_VOCALS.map((key) => ({ key, label: VOCAL_LABELS[key] ?? key }));
 export const ANY_SENTINEL = '__any__';
-// Mirrors the controller's SHOW_FILTER_VALUES_MAX cap
-// (controller/src/settings/vocab.ts — read the comment there before changing
-// this number). Drift is caught by controller/scripts/show-filter-cap.test.ts:
-// a UI cap ABOVE the controller's turns a save into a validator 400, one BELOW
-// silently hides entries the operator is allowed to add.
-export const FILTER_VALUES_MAX = 15;
+export const FILTER_VALUES_MAX = SHOW_FILTER_VALUES_MAX;
 
 export function sameEra(a: EraWindow, b: { from: number | null; to: number | null } | EraWindow): boolean {
   const bf = 'from' in b ? b.from : b.fromYear;
@@ -128,8 +143,8 @@ export function eraLabelOf(e: EraWindow): string {
   return e.fromYear != null ? `${e.fromYear}+` : `≤${e.toYear}`;
 }
 
-// View of a theme returned by GET /themes. We keep the token map here so the
-// theme picker can render real colour swatches (see ShowPickers.ThemePicker).
+// From GET /themes. The token map is kept so the picker can render real colour
+// swatches (ShowPickers.ThemePicker).
 export interface ThemeOption {
   id: string;
   name: string;
@@ -138,8 +153,7 @@ export interface ThemeOption {
   tokens?: Record<string, string>;
 }
 
-/** One entry of the /dj/skills catalogue — the programme feature-segment pin
- *  only needs the kind + a label; disabled skills are filtered on fetch. */
+/** From /dj/skills; disabled skills are filtered out on fetch. */
 export interface SkillOption {
   kind: string;
   label?: string;
@@ -162,6 +176,18 @@ export interface Schedule {
 export interface FormState {
   shows: Show[];
   schedule: Schedule;
+}
+
+// The react-hook-form shape. `schedule` is not form data — the panel reads it
+// for the hours-a-week counts and the Rundown page owns PUT /schedule.
+//
+// Hand-written rather than derived from z.input<typeof showSchema>: that input
+// type is `unknown` all the way down (the legacy-field migration wraps the
+// object in a z.preprocess, and most fields are pipelines of their own), so no
+// nested path would type-check as a FieldPath. `Show` is what the schema's
+// parse actually produces.
+export interface ShowsFormValues {
+  shows: Show[];
 }
 
 export interface SettingsResponse {

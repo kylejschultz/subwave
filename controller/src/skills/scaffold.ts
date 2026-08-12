@@ -17,13 +17,40 @@
 // template, restoring the as-shipped skill (and pulling in a newer image's
 // tool.mjs). It backs the admin "Reset to default" button.
 
-import { copyFile, mkdir, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { STATE_DIR, config } from '../config.js';
 import { queue } from '../broadcast/queue.js';
-import { SEEDED_KINDS, discoverSeededKinds, readTemplate } from './loader.js';
+import { SEEDED_KINDS, discoverSeededKinds, readTemplate, parseFrontmatter } from './loader.js';
+import { preservedFrontmatter } from './config-fields.js';
 
 const SKILLS_DIR = resolve(STATE_DIR, 'skills');
+
+// Render one frontmatter VALUE, quoting ONLY when the value would not survive
+// the round trip bare. The loader parses SKILL.md as real YAML now, so a value
+// that happens to be YAML syntax has to be escaped on the way out — a label of
+// `News: Today` emitted bare is a parse error, and a knob whose value is `007`
+// comes back as the number 7.
+//
+// The test is the round trip itself rather than a list of dangerous characters,
+// because the interesting cases are the ones a character list misses. `6` needs
+// no quotes (it parses as a number, and the loader flattens every value back to
+// a string, so "6" is what a reader gets either way), while `007` does. Being
+// minimal here matters: this rewrites files operators read and hand-edit, and
+// quoting values that never needed it would churn every SKILL.md on the first
+// save after the upgrade. `lineWidth: 0` disables folding, which would otherwise
+// wrap a long feed URL across lines.
+function yamlScalar(value: string): string {
+  try {
+    const parsed = parseYaml(`v: ${value}`) as Record<string, unknown> | null;
+    const back = parsed?.v;
+    // Mirrors the loader's flattening: a scalar becomes its String() form, and
+    // anything else (a list, a map, null) does not round-trip as this string.
+    if (back != null && typeof back !== 'object' && String(back) === value) return value;
+  } catch { /* not parseable bare — fall through and quote it */ }
+  return stringifyYaml(value, { lineWidth: 0 }).trimEnd();
+}
 
 // Inverse of loader.js parseCooldownMs — render ms back to the shortest exact
 // "Nd" | "Nh" | "Nm" form for a readable seeded frontmatter value. Kept here for
@@ -42,8 +69,15 @@ interface SkillFileFields {
   contextFields?: string[]; // "right now" fields the segment may mention (#471)
   window?: 'any' | 'commute'; // custom skills only — emitted when 'commute'
   requiresKey?: string;       // custom skills only — env var the skill needs
-  feed?: string;        // news only
-  feedMaxItems?: number; // news only
+  // Values for the knobs the skill's own tool.mjs declares (`configFields`),
+  // already validated by skills/config-fields.ts. Written as flat frontmatter
+  // lines — an omitted key clears its line. Replaces the old news-only
+  // feed/feedMaxItems pair (#1300).
+  config?: Record<string, string | number>;
+  // The keys the skill DECLARES, whether or not `config` carries a value for
+  // each. Drives the preserve pass below: a declared-but-cleared knob stays
+  // cleared, while anything undeclared is carried through verbatim.
+  configKeys?: string[];
   tags?: string[];      // freeform organisation tags
   brief?: string;
 }
@@ -55,20 +89,44 @@ interface SkillFileFields {
 // sibling `tool.mjs`, so editing a skill's brief leaves its data tool intact.
 export async function writeSkillFile(fields: SkillFileFields): Promise<void> {
   const { kind } = fields;
-  const lines = ['---', `name: ${kind}`];
-  if (fields.label) lines.push(`label: ${fields.label}`);
-  if (fields.cooldown) lines.push(`cooldown: ${fields.cooldown}`);
+  const dir = join(SKILLS_DIR, kind);
+
+  // Frontmatter this rewrite must not eat. Everything below is emitted from
+  // typed fields, so a key we don't write is a key we DELETE — which is how a
+  // hand-added `feed:` used to vanish on the operator's first save (#1300), and
+  // how a declared knob would still vanish whenever tool.mjs failed to import
+  // (no declaration visible → no values written). Read the file we're about to
+  // replace and carry the rest through. Best-effort: no file (create), or an
+  // unreadable one, just means nothing to preserve.
+  let carried: Array<[string, string]> = [];
+  try {
+    const existing = await readFile(join(dir, 'SKILL.md'), 'utf8');
+    carried = preservedFrontmatter(parseFrontmatter(existing).data, fields.configKeys || []);
+  } catch { /* no existing file — nothing to carry */ }
+
+  const line = (key: string, value: string) => `${key}: ${yamlScalar(value)}`;
+
+  const lines = ['---', line('name', kind)];
+  if (fields.label) lines.push(line('label', fields.label));
+  if (fields.cooldown) lines.push(line('cooldown', fields.cooldown));
   // The "right now" fields this segment may weave in (issue #471).
-  if (fields.contextFields && fields.contextFields.length) lines.push(`context: ${fields.contextFields.join(', ')}`);
+  if (fields.contextFields && fields.contextFields.length) lines.push(line('context', fields.contextFields.join(', ')));
   // Custom-skill knobs. `window: any` is the loader default, so only the
   // restrictive `commute` value is worth writing.
   if (fields.window === 'commute') lines.push('window: commute');
-  if (fields.requiresKey) lines.push(`requiresKey: ${fields.requiresKey}`);
-  if (fields.feed) lines.push(`feed: ${fields.feed}`);
-  if (fields.feedMaxItems) lines.push(`feedMaxItems: ${fields.feedMaxItems}`);
-  if (fields.tags && fields.tags.length) lines.push(`tags: ${fields.tags.join(', ')}`);
+  if (fields.requiresKey) lines.push(line('requiresKey', fields.requiresKey));
+  // Skill-declared knobs (news' feed / feedMaxItems, and anything a custom
+  // tool.mjs declares). Insertion order follows the declaration.
+  for (const [key, value] of Object.entries(fields.config || {})) {
+    const flat = String(value).replace(/[\r\n]+/g, ' ').trim();
+    if (flat) lines.push(line(key, flat));
+  }
+  // Undeclared keys the previous file carried — hand-authored knobs a tool
+  // reads straight off `config`, and anything a not-currently-loadable tool.mjs
+  // declares. Kept in their original file order.
+  for (const [key, value] of carried) lines.push(line(key, value));
+  if (fields.tags && fields.tags.length) lines.push(line('tags', fields.tags.join(', ')));
   lines.push('---', (fields.brief || '').trim(), '');
-  const dir = join(SKILLS_DIR, kind);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, 'SKILL.md'), lines.join('\n'), 'utf8');
 }
@@ -86,12 +144,17 @@ async function fileExists(path: string): Promise<boolean> {
 // frontmatter block, returning the new text. Used to seed news' feed /
 // feedMaxItems into the (feed-less) template while keeping the rest verbatim.
 function upsertFrontmatterKey(md: string, key: string, value: string): string {
+  // The value here comes from env (NEWS_FEED_URL), so it goes through the same
+  // quoting as every other emitted value rather than being interpolated raw.
+  const rendered = `${key}: ${yamlScalar(value)}`;
   const re = new RegExp(`^${key}:.*$`, 'm');
-  if (re.test(md)) return md.replace(re, `${key}: ${value}`);
+  // Function replacement: a `$` in the rendered value (a URL query, say) must
+  // not be read as a `$&`-style capture reference.
+  if (re.test(md)) return md.replace(re, () => rendered);
   // Insert just before the closing '---' of the frontmatter block.
   const m = /^(---\s*\n[\s\S]*?\n)(---\s*\n)/.exec(md);
   if (!m) return md; // no frontmatter — nothing to do
-  return md.slice(0, m[1].length) + `${key}: ${value}\n` + md.slice(m[1].length);
+  return md.slice(0, m[1].length) + `${rendered}\n` + md.slice(m[1].length);
 }
 
 // The SKILL.md text to seed for a built-in: the template verbatim, except news'
