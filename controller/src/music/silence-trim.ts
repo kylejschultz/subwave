@@ -150,9 +150,8 @@ export function shiftOnsetMs(
   return shiftOnsetByCueMs(resolveSilenceTrim(track).cueInSec, onsetMs);
 }
 
-// shiftOnsetMs for a cue already resolved: the one a drained play carries
-// (`item.cueInSec`, which a stem seam can move past the trim's own cue). For a
-// reader that has the PLAY rather than only the track.
+// shiftOnsetMs for a cue already resolved, for a reader that has the PLAY
+// rather than only the track: the cue a drained play was stamped with.
 export function shiftOnsetByCueMs(
   cueInSec: number | null | undefined,
   onsetMs: number | null | undefined,

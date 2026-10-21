@@ -41,11 +41,12 @@ export class BoundedLyricsCache<T> {
     }
     if (existing) this.entries.delete(key);
 
-    // Start with the short TTL so an in-flight failure is bounded too. It is
-    // adjusted once the lookup resolves, while all concurrent callers await
-    // this same promise rather than fanning out to Subsonic.
+    // An in-flight lookup never expires: every caller until it settles awaits
+    // this same promise rather than fanning out to Subsonic. The TTL starts
+    // when it settles. Unbounded only as long as the load is, and the Subsonic
+    // call carries its own timeout.
     const entry: CacheEntry<T> = {
-      expiresAt: now + this.negativeTtlMs,
+      expiresAt: Number.POSITIVE_INFINITY,
       value: Promise.resolve().then(load),
     };
     this.entries.set(key, entry);

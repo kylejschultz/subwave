@@ -41,6 +41,7 @@ const lyricCache = new BoundedLyricsCache<StructuredLyricsInput>({
 interface PlayRecord {
   track?: { id?: string | null } | null;
   cueInSec?: number;
+  stemSeam?: boolean;
   source?: string;
 }
 
@@ -57,13 +58,20 @@ export function heardPlay(
   return history.slice(0, RECENT_PLAYS).find((p) => p?.track?.id === songId);
 }
 
-// Where in the file this play began. A drained play carries the cue the queue
-// stamped on it, which is the one Liquidsoap got (a stem seam can move it past
-// the trim's own); the auto playlist stamps the trim policy's cue and keeps no
-// record of it, so that is asked again, as /now-playing does.
-function cueInFor(play: PlayRecord | null, songId: string): number | null {
-  if (play && play.source !== 'auto') return play.cueInSec ?? null;
-  return resolveSilenceTrim(library.get(songId)).cueInSec;
+// Where in the file the listener's clock for this play starts. That clock is
+// now-playing's start, so:
+//   - a stem-blended play starts at byte 0: its clip IS the track's own head,
+//     from byte 0 to the cue, annotated as the track so now-playing flips when
+//     the clip begins. Its stamped cueInSec is where the real file resumes
+//     AFTER the clip, not where the listener's clock began. (A blend never
+//     renders over a trimmed head, so there is no trim to account for either.)
+//   - any other drained play starts at the cue the queue stamped, the one
+//     Liquidsoap got.
+//   - an auto-playlist play has no record of its cue; the playlist line
+//     carried the trim policy's, so that is asked again, as /now-playing does.
+export function cueInFor(play: PlayRecord | null, policyCueInSec: () => number | null): number | null {
+  if (play && play.source !== 'auto') return play.stemSeam ? null : (play.cueInSec ?? null);
+  return policyCueInSec();
 }
 
 async function lyricsEnabled(_req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -101,7 +109,8 @@ router.get('/lyrics/current', lyricsEnabled, requireStationAuth, async (req, res
     }
 
     const offsetMs = await library.getLyricOffset(songId);
-    res.json(toPublicLyricsPayload(songId, lyrics, { offsetMs, cueInSec: cueInFor(play, songId) }));
+    const cueInSec = cueInFor(play, () => resolveSilenceTrim(library.get(songId)).cueInSec);
+    res.json(toPublicLyricsPayload(songId, lyrics, { offsetMs, cueInSec }));
   } catch (err) {
     queue.log('error', `/lyrics/current failed: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'internal error' });

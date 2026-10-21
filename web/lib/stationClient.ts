@@ -66,6 +66,9 @@ export type LyricsResult =
   | { kind: 'disabled' }
   /** The track has left the station's recent-play window. */
   | { kind: 'gone' }
+  /** A private station refused the stored password (or there is none). Not
+   *  retried: every refusal spends the address's station-read attempts. */
+  | { kind: 'locked' }
   | { kind: 'unavailable'; retryAfterSec: number | null };
 
 export interface StationClient {
@@ -168,6 +171,7 @@ export function createStationClient(origin: StationOrigin): StationClient {
         });
         if (r.status === 403) return { kind: 'disabled' };
         if (r.status === 409) return { kind: 'gone' };
+        if (r.status === 401) return { kind: 'locked' };
         if (!r.ok) {
           const retryAfter = Number(r.headers.get('Retry-After'));
           return { kind: 'unavailable', retryAfterSec: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null };

@@ -39,7 +39,9 @@ export type LyricsStatus =
   /** The operator has the Lyrics panel switched off. */
   | 'disabled'
   /** The track left the station's recent-play window before we asked. */
-  | 'gone';
+  | 'gone'
+  /** A private station wants its password, and this browser has not got it. */
+  | 'locked';
 
 export interface UseCurrentLyricsOptions {
   /** The listener's now-playing `subsonic_id`. */
@@ -136,8 +138,10 @@ export function useCurrentLyrics({ songId, trackStartedAt }: UseCurrentLyricsOpt
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [deviceOffsetMs, setDeviceOffsetState] = useState(0);
   const [draft, setDraft] = useState<{ songId: string; offsetMs: number } | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  // Keyed by track, like the draft: a save still in flight when the song
+  // changes must not disable, or report its failure on, the next song's controls.
+  const [savingFor, setSavingFor] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<{ songId: string; message: string } | null>(null);
 
   useEffect(() => {
     setDeviceOffsetState(readDeviceOffset());
@@ -213,8 +217,9 @@ export function useCurrentLyrics({ songId, trackStartedAt }: UseCurrentLyricsOpt
 
   const saveStation = useCallback(async () => {
     if (!id || draftMs == null) return;
-    setSaving(true);
+    setSavingFor(id);
     setSaveError(null);
+    const fail = (message: string) => setSaveError({ songId: id, message });
     try {
       const res = await adminFetch(`/lyrics/offsets/${encodeURIComponent(id)}`, {
         method: 'PUT',
@@ -223,17 +228,17 @@ export function useCurrentLyrics({ songId, trackStartedAt }: UseCurrentLyricsOpt
       });
       if (!res.ok) {
         const body = await res.json().catch(() => null) as { error?: string } | null;
-        setSaveError(res.status === 401 ? 'Sign in to the admin console again to save.' : body?.error || 'Could not save.');
+        fail(res.status === 401 ? 'Sign in to the admin console again to save.' : body?.error || 'Could not save.');
         return;
       }
       setAnswer((prev) => (prev.songId === id && prev.lyrics
         ? { ...prev, lyrics: { ...prev.lyrics, offsetMs: draftMs } }
         : prev));
-      setDraft(null);
+      setDraft((prev) => (prev?.songId === id ? null : prev));
     } catch {
-      setSaveError('Could not reach the station.');
+      fail('Could not reach the station.');
     } finally {
-      setSaving(false);
+      setSavingFor((prev) => (prev === id ? null : prev));
     }
   }, [adminFetch, draftMs, id]);
 
@@ -254,8 +259,8 @@ export function useCurrentLyrics({ songId, trackStartedAt }: UseCurrentLyricsOpt
       offsetMs: stationMs,
       savedMs,
       dirty: draftMs != null && draftMs !== savedMs,
-      saving,
-      error: saveError,
+      saving: savingFor != null && savingFor === id,
+      error: saveError && saveError.songId === id ? saveError.message : null,
       set: setStation,
       save: saveStation,
     },

@@ -30,6 +30,7 @@ export function LyricsCard({ data, form, setForm }: LyricsPartProps) {
             {ly.enabled !== saved && <Pill tone="accent" dot>unsaved</Pill>}
           </div>
           <Seg
+            aria-label="Lyrics panel"
             value={ly.enabled ? 'on' : 'off'}
             onChange={v => setForm(f => ({ ...f, lyrics: { ...f.lyrics, enabled: v === 'on' } }))}
             options={[{ id: 'off', label: 'Off' }, { id: 'on', label: 'On' }]}

@@ -30,6 +30,9 @@ const LYRICS: Record<string, () => { status: number; body: unknown }> = {
     body: { 'subsonic-response': { status: 'failed', version: '1.16.1', error: { code: 70, message: 'not found' } } },
   }),
   'song-down': () => ({ status: 500, body: 'navidrome fell over' }),
+  // A server without the OpenSubsonic lyrics endpoint.
+  'song-noapi': () => ({ status: 404, body: '404 page not found' }),
+  'song-501': () => ({ status: 501, body: 'not implemented' }),
 };
 
 function navidrome(req: IncomingMessage, res: ServerResponse) {
@@ -63,8 +66,10 @@ const db = await import('../src/music/library-db.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const { router } = await import('../src/routes/lyrics.js');
 const { router: publicRouter } = await import('../src/routes/public.js');
+const { cors } = await import('../src/middleware/cors.js');
 
 const app = express();
+app.use(cors);
 app.use(express.json());
 app.use(router);
 app.use(publicRouter);
@@ -156,6 +161,18 @@ test('a listener behind the live edge gets the track it is hearing, within the r
   assert.equal((await get(`/lyrics/current?songId=${'x'.repeat(201)}`)).status, 400);
 });
 
+test('a stem-blended play is not shifted: its clip is the track from byte zero under its own name', async () => {
+  // The clip is the incoming track's head from byte 0 to the cue, annotated as
+  // that track, so now-playing (and the listener's clock) starts at file time
+  // 0. cueInSec on the item is where the real file resumes after the clip.
+  queue.current = play('song-live', { source: 'dj', stemSeam: true, cueInSec: 7.7 }) as never;
+  const r = await get('/lyrics/current');
+  assert.deepEqual(r.body.lines, [
+    { startMs: 8000, text: 'first sung line' },
+    { startMs: 11_500, text: 'second sung line' },
+  ]);
+});
+
 test('an auto-playlist play is shifted by the trim policy, which is what its playlist line carried', async () => {
   await library.load();
   db.upsertTrackMeta('song-auto', { title: 'song-auto', artist: 'A', album: 'B', duration: 200 });
@@ -172,7 +189,7 @@ test('an auto-playlist play is shifted by the trim policy, which is what its pla
 });
 
 test('no lyrics and an unknown song are answers; an outage is a 503, asked again only after the window', async () => {
-  for (const id of ['song-none', 'song-gone']) {
+  for (const id of ['song-none', 'song-gone', 'song-noapi', 'song-501']) {
     onAir = id;
     queue.current = play(id, { source: 'dj' }) as never;
     const r = await get('/lyrics/current');
@@ -226,4 +243,22 @@ test('nothing on air answers an empty payload rather than an error', async () =>
   const r = await get('/lyrics/current');
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, { songId: null, synced: false, offsetMs: 0, lines: [] });
+});
+
+test('a cross-origin player may send the station password and read Retry-After', async () => {
+  // A browser preflights a request carrying x-station-auth; a header missing
+  // from Allow-Headers fails the request before it is sent.
+  const pre = await fetch(`${base}/lyrics/current?songId=song-live`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'http://player.example',
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'x-station-auth',
+    },
+  });
+  assert.equal(pre.status, 200);
+  const allowed = (pre.headers.get('access-control-allow-headers') || '').toLowerCase().split(/\s*,\s*/);
+  assert.ok(allowed.includes('x-station-auth'), `allowed: ${allowed.join(', ')}`);
+  const exposed = (pre.headers.get('access-control-expose-headers') || '').toLowerCase();
+  assert.match(exposed, /retry-after/);
 });

@@ -128,7 +128,8 @@ for the on-air track.
   advances the highlighting, negative delays it.
 - Empty `lines` means the track has no lyrics, or the item is not a library
   track (`songId: null`). Instrumental placeholders (`[au: instrumental]`) count
-  as no lyrics.
+  as no lyrics, and so does a music server without the OpenSubsonic lyrics
+  endpoint (it answers that call with HTTP 404 or 501).
 - `503` means the music server did not answer. It is never "no lyrics": retry
   after the `Retry-After` seconds.
 

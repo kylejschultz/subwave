@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import { Minus, Plus, RotateCcw, SlidersHorizontal } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useSkinCalm } from '@/components/skins/sharedHooks';
@@ -40,6 +40,8 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
   const userScrolledAt = useRef(0);
   const followedOnce = useRef(false);
   const calm = useSkinCalm();
+  const deviceHintId = useId();
+  const stationHintId = useId();
   const { status, lyrics, activeLineIndex: active, deviceOffsetMs, setDeviceOffsetMs, station } =
     useCurrentLyrics({ songId, trackStartedAt });
 
@@ -89,6 +91,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
   }
   if (status === 'disabled') return <Note>Lyrics are switched off on this station.</Note>;
   if (status === 'gone') return <Note>This song has left the air, so its lyrics are no longer available.</Note>;
+  if (status === 'locked') return <Note>This station is private. Unlock the player with its password to see lyrics.</Note>;
   if (status === 'unavailable') {
     return <Note>Lyrics are not reachable right now. Trying again…</Note>;
   }
@@ -167,6 +170,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
           <div className="mb-1.5 flex items-center justify-between gap-3">
             <div className="text-[9px] tracking-[0.28em] text-muted uppercase" title="Only changes what this browser shows">
               This device
+              <span id={deviceHintId} className="sr-only">Only changes what this browser shows.</span>
             </div>
             <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(deviceOffsetMs)}</div>
           </div>
@@ -188,6 +192,8 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
               value={deviceOffsetMs}
               onChange={(event: ChangeEvent<HTMLInputElement>) => setDeviceOffsetMs(Number(event.target.value))}
               aria-label="Lyrics timing on this device"
+              aria-valuetext={formatLyricOffset(deviceOffsetMs)}
+              aria-describedby={deviceHintId}
               className="h-8 min-w-0 flex-1 accent-[var(--accent)] opacity-70"
             />
             <button
@@ -218,8 +224,15 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
                   title="Fixes this track's lyric file for every listener. Shown because this browser is signed in as the operator."
                 >
                   Station · this track
+                  <span id={stationHintId} className="sr-only">
+                    Fixes this track&apos;s lyric file for every listener, once saved.
+                  </span>
                 </div>
-                <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(station.offsetMs)}</div>
+                <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink" aria-live="polite">
+                  <span className="sr-only">Station timing </span>
+                  {formatLyricOffset(station.offsetMs)}
+                  {station.dirty && <span className="sr-only">, not saved</span>}
+                </div>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -228,6 +241,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
                   onClick={() => station.set(station.offsetMs - LYRIC_OFFSET_NUDGE_MS)}
                   disabled={station.saving}
                   aria-label="Delay this track's lyrics for every listener"
+                  aria-describedby={stationHintId}
                   title="Delay lyrics"
                 >
                   <Minus size={14} strokeWidth={1.8} />
@@ -238,6 +252,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
                   onClick={() => station.set(station.offsetMs + LYRIC_OFFSET_NUDGE_MS)}
                   disabled={station.saving}
                   aria-label="Advance this track's lyrics for every listener"
+                  aria-describedby={stationHintId}
                   title="Advance lyrics"
                 >
                   <Plus size={14} strokeWidth={1.8} />
@@ -248,6 +263,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
                   onClick={() => station.set(0)}
                   disabled={station.saving || station.offsetMs === 0}
                   aria-label="Clear this track's station timing"
+                  aria-describedby={stationHintId}
                   title="Clear"
                 >
                   <RotateCcw size={14} strokeWidth={1.8} />

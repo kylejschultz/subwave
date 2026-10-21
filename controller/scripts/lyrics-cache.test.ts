@@ -54,3 +54,21 @@ test('holds at most maxEntries tracks, dropping the least recently used', async 
   await cache.get('b', load('b'));
   assert.deepEqual(loads, ['a', 'b', 'c', 'b']);
 });
+
+test('a slow lookup is shared for its whole flight, however long past the TTLs', async () => {
+  let now = 0;
+  const cache = new BoundedLyricsCache<string>({ positiveTtlMs: 30, negativeTtlMs: 10, now: () => now });
+  let calls = 0;
+  let release!: (v: string) => void;
+  const slow = () => { calls++; return new Promise<string>((r) => { release = r; }); };
+  const first = cache.get('song', slow);
+  await Promise.resolve();
+  now = 25; // past the negative TTL, still in flight
+  const second = cache.get('song', slow);
+  release('lyrics');
+  assert.deepEqual(await Promise.all([first, second]), ['lyrics', 'lyrics']);
+  assert.equal(calls, 1, 'the second caller joined the flight rather than starting another');
+  now = 50; // inside the positive TTL counted from when it settled
+  assert.equal(await cache.get('song', slow), 'lyrics');
+  assert.equal(calls, 1);
+});
