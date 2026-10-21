@@ -43,8 +43,8 @@ an admin credential:
   than `activePersonaId` behind the mic).
 - `GET /now-playing` — the current track, plus `context.activeShow` with the
   live show's host and guests already hydrated.
-- `GET /lyrics/current` — lyrics for the currently airing library track, when
-  the connected Subsonic server exposes them for that song.
+- `GET /lyrics/current` — lyrics for the track a listener is hearing, when the
+  operator has the Lyrics panel on (see **Lyrics** below).
 
 **Persona souls are opt-in.** A persona's `soul` is its system prompt rather
 than a written bio, so the roster-wide reads above publish it only when the
@@ -91,16 +91,20 @@ Failed attempts on a station-gated read are rate-limited per IP (20 per 15
 minutes) in their **own** counter — spending them cannot lock a listener out of
 the player's password box, which has a separate one.
 
-## Current-track lyrics
+## Lyrics
 
-`GET /lyrics/current` is an unauthenticated public read for listener-facing
-players and custom skins. It resolves the current on-air item to its
-`subsonic_id`, asks the connected Subsonic server for structured lyrics, and
-returns a small normalized payload. Pass a stable opaque `clientId` query
-parameter when the player wants Subwave to include that listener/client's saved
-per-track timing correction. Generate the id inside the player and store it
-locally; it should not be an account id, email address, or other personal
-identifier.
+`GET /lyrics/current` serves lyrics to listener-facing players and custom
+skins. It is off until the operator turns on **Settings → Listeners → Lyrics**
+(`settings.lyrics.enabled`); while off it answers `403` and `GET /state` carries
+`lyrics: { enabled: false }`, which is how a skin knows to hide its panel. It is
+a **station** read, gated like `/similar-tracks`: open on a public station, and
+on a private one it needs the station password (`x-station-auth` header).
+
+A listener hears the stream `stream.bufferSeconds` behind the live edge, so a
+player passes the track it is showing as `?songId=` (now-playing's
+`subsonic_id`). The station answers for the on-air track or one of the three
+before it, and refuses anything older with `409`. Without `songId` it answers
+for the on-air track.
 
 ```json
 {
@@ -114,36 +118,24 @@ identifier.
 }
 ```
 
-`songId` is `null` when the on-air item is not a library track. `lines` is empty
-when no lyrics are indexed for the current track, when the current item is not a
-library track, or when the upstream lyrics lookup fails. Synced lyrics preserve
-source line timing in `startMs`; unsynced/plain lyrics use `null` for `startMs`
-and set `synced` to `false`.
+- `startMs` is on the **played** timeline: when the dead-air trim cut a silent
+  head off the track, the lines are already moved back by the same amount, so a
+  player compares them with elapsed time since the track started. Untimed
+  lines carry `null` and `synced` is `false`.
+- `offsetMs` is the station's correction for this track's lyric file, set by
+  the operator. It is not folded into the lines; a player adds it at render
+  time: `effectiveElapsedMs = elapsedSinceTrackStartMs + offsetMs`. Positive
+  advances the highlighting, negative delays it.
+- Empty `lines` means the track has no lyrics, or the item is not a library
+  track (`songId: null`). Instrumental placeholders (`[au: instrumental]`) count
+  as no lyrics.
+- `503` means the music server did not answer. It is never "no lyrics": retry
+  after the `Retry-After` seconds.
 
-`offsetMs` is a client-scoped correction for the current track. It is not folded
-into each line's `startMs`; players apply it at render time:
-
-```text
-effectiveElapsedMs = measuredPlaybackElapsedMs + offsetMs
-```
-
-Positive values advance lyric highlighting sooner. Negative values delay it.
-
-`PUT /lyrics/current/offset` saves that correction for the current track and
-client:
-
-```json
-{
-  "songId": "abc123",
-  "clientId": "listener-device-or-app-id",
-  "offsetMs": 2900
-}
-```
-
-The write is public but scoped by `clientId` and verified against the current
-on-air song, so one listener's correction does not change station-wide lyric
-data or affect other players. The server rejects stale writes when the submitted
-`songId` no longer matches the current track.
+The operator sets the correction with `PUT /lyrics/offsets/:trackId` (admin),
+body `{ "offsetMs": 2900 }`, a whole number from `-30000` to `30000`; `0`
+clears it. It applies to every listener. The Classic player's Lyrics panel
+shows this control to a browser signed in to the admin console.
 
 ## OpenAPI
 

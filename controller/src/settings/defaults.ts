@@ -808,6 +808,13 @@ export const DEFAULTS = {
     maxTracks: 10,
     windowDays: 30, // 0 = all time
   },
+
+  // The listener Lyrics panel (`GET /lyrics/current`). Off until an operator
+  // turns it on — it republishes lyric text publicly and costs a music-server
+  // call per track. Per-track timing fixes live in library.db, not here.
+  lyrics: {
+    enabled: false,
+  },
 };
 
 export const BOUNDS = {

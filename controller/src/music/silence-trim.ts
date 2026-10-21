@@ -147,9 +147,18 @@ export function shiftOnsetMs(
   track: SilenceTrimTrack | null | undefined,
   onsetMs: number | null | undefined,
 ): number | null {
+  return shiftOnsetByCueMs(resolveSilenceTrim(track).cueInSec, onsetMs);
+}
+
+// shiftOnsetMs for a cue already resolved: the one a drained play carries
+// (`item.cueInSec`, which a stem seam can move past the trim's own cue). For a
+// reader that has the PLAY rather than only the track.
+export function shiftOnsetByCueMs(
+  cueInSec: number | null | undefined,
+  onsetMs: number | null | undefined,
+): number | null {
   if (onsetMs == null || !Number.isFinite(onsetMs)) return null;
-  const { cueInSec } = resolveSilenceTrim(track);
-  if (cueInSec == null) return onsetMs;
+  if (typeof cueInSec !== 'number' || !Number.isFinite(cueInSec)) return onsetMs;
   return Math.max(0, Math.round(onsetMs - cueInSec * 1000));
 }
 

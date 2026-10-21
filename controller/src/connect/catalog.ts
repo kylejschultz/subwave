@@ -138,23 +138,27 @@ export const ENDPOINT_GROUPS: EndpointGroup[] = [
       {
         method: 'GET',
         path: '/lyrics/current',
-        summary: 'Current track lyrics',
+        summary: 'Lyrics for the track a listener is hearing',
         description:
-          'Lyrics for the currently airing library track, normalized from the ' +
-          'connected Subsonic server\'s structured lyrics response. Empty `lines` ' +
-          'means the current item is not a library track, no lyrics are indexed ' +
-          'for the track, or the upstream lyrics lookup failed. Timed lyrics keep ' +
-          'their source `startMs`; unsynced/plain lyrics use `null` timings. ' +
-          '`offsetMs` is returned separately: add it to measured playback elapsed ' +
-          'time before choosing the active line. Pass a stable opaque `clientId` ' +
-          'query parameter to include that client\'s saved per-track correction.',
-        auth: 'none',
+          'Lyrics for a library track, normalized from the music server\'s ' +
+          'structured lyrics. A listener hears the stream a buffer behind the live ' +
+          'edge, so pass the `songId` the player is showing; the station answers ' +
+          'for the on-air track or one of the three before it, and 409s anything ' +
+          'older. Omit it for the on-air track. Timed lines carry `startMs` on the ' +
+          'PLAYED timeline (a trimmed silent head already taken off), so compare ' +
+          'them with elapsed time since the track started; untimed lines carry ' +
+          'null. `offsetMs` is the station\'s correction for this track: add it to ' +
+          'elapsed time before choosing the active line. Empty `lines` means the ' +
+          'track has no lyrics (or is not a library track). A 503 means the music ' +
+          'server did not answer — retry after `Retry-After`, never read it as "no ' +
+          'lyrics". 403 when the operator has the Lyrics panel switched off. ' +
+          'Station-gated like `/similar-tracks`: open on a public station.',
+        auth: 'station',
         queryParams: [
           {
-            name: 'clientId',
-            description:
-              'Stable opaque listener/player id used only for that client\'s saved lyric timing corrections. Do not use an account id or other personal identifier.',
-            example: 'player_7f2b9c',
+            name: 'songId',
+            description: 'The track the player is showing (now-playing\'s `subsonic_id`). Omit for the on-air track.',
+            example: 'a1b2c3',
           },
         ],
         responseExample: {
@@ -165,28 +169,6 @@ export const ENDPOINT_GROUPS: EndpointGroup[] = [
             { startMs: 12500, text: 'First lyric line' },
             { startMs: 15300, text: 'Second lyric line' },
           ],
-        },
-      },
-      {
-        method: 'PUT',
-        path: '/lyrics/current/offset',
-        summary: 'Save lyric timing correction',
-        description:
-          'Stores this client\'s per-track lyric timing correction for the current ' +
-          'on-air library track. The client id is opaque and listener-scoped; this ' +
-          'does not alter station-wide lyric data or affect other players. Positive ' +
-          '`offsetMs` advances lyric highlighting sooner; negative values delay it. ' +
-          'The request is rejected if `songId` no longer matches the current track.',
-        auth: 'none',
-        bodyExample: {
-          songId: 'a1b2c3',
-          clientId: 'player_7f2b9c',
-          offsetMs: 2900,
-        },
-        responseExample: {
-          ok: true,
-          songId: 'a1b2c3',
-          offsetMs: 2900,
         },
       },
       {

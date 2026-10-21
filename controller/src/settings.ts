@@ -1365,6 +1365,12 @@ export async function load() {
         ? Math.min(365, Math.max(0, Math.round(Number(stored.likes.windowDays))))
         : DEFAULTS.likes.windowDays,
     },
+    lyrics: {
+      enabled:
+        typeof stored.lyrics?.enabled === 'boolean'
+          ? stored.lyrics.enabled
+          : DEFAULTS.lyrics.enabled,
+    },
   };
   setCache(loaded);
   if (typeof stored.timezone === 'string' && stored.timezone.trim() && !loaded.timezone) {
@@ -2625,6 +2631,10 @@ export async function prepareUpdate(patch, { themeIds }: { themeIds?: ReadonlySe
     ] as const) {
       if (lk[k] !== undefined) (next.likes as Record<string, unknown>)[k] = lk[k];
     }
+  }
+  if ('lyrics' in patch) {
+    const ly = parseSettingsPatchKey<Record<string, unknown>>('lyrics', patch.lyrics);
+    if (ly.enabled !== undefined) next.lyrics.enabled = ly.enabled as boolean;
   }
 
   // Post-patch integrity sweep — a personas/shows change in this patch may

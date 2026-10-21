@@ -210,14 +210,15 @@ export function getPlaybackMeta(songId: string): db.TrackLite | null {
   return loaded ? db.getTrackLite(songId) : null;
 }
 
-export async function getLyricOffset(songId: string, clientId: string): Promise<number> {
+// The operator's station-wide lyric timing correction (library-db/lyrics.ts).
+export async function getLyricOffset(songId: string): Promise<number> {
   await load();
-  return db.getLyricOffset(clientId, songId);
+  return db.getLyricOffset(songId);
 }
 
-export async function setLyricOffset(songId: string, clientId: string, offsetMs: number): Promise<number> {
+export async function setLyricOffset(songId: string, offsetMs: number): Promise<void> {
   await load();
-  return db.setLyricOffset(clientId, songId, offsetMs);
+  db.setLyricOffset(songId, offsetMs);
 }
 
 // When a track entered the library, null if not in the tagged index. Playlist

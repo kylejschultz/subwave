@@ -1,18 +1,10 @@
+// The public lyrics payload (music/lyrics-public.ts): which lines a player
+// gets, and on which timeline their timings sit.
+//
+// Run: `npm test -- lyrics-public`.
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toPublicLyricsPayload } from '../src/music/lyrics-public.js';
-
-let failures = 0;
-function test(name: string, fn: () => void) {
-  try {
-    fn();
-    console.log(`  ✓ ${name}`);
-  } catch (err: any) {
-    failures++;
-    console.error(`  ✗ ${name}\n      ${err?.message || err}`);
-  }
-}
-
-console.log('public lyrics payload:');
 
 test('empty when there is no current library song', () => {
   assert.deepEqual(toPublicLyricsPayload(null, null), {
@@ -35,7 +27,7 @@ test('trims blank lines and preserves synced timing', () => {
           { startMs: 3000, text: 'second line' },
         ],
       },
-      2500,
+      { offsetMs: 2500 },
     ),
     {
       songId: 'abc123',
@@ -57,7 +49,7 @@ test('unsynced lyrics publish null start offsets', () => {
         synced: false,
         lines: [{ startMs: Number.NaN, text: 'plain lyric line' }],
       },
-      -400,
+      { offsetMs: -400 },
     ),
     {
       songId: 'abc123',
@@ -118,8 +110,52 @@ test('markers are dropped without discarding the real lines around them', () => 
   );
 });
 
-if (failures) {
-  console.error(`\n✗ ${failures} check(s) failed`);
-  process.exit(1);
-}
-console.log('\n✓ all public lyrics payload checks passed');
+test('timings move onto the played timeline when the head was trimmed', () => {
+  // A 6s leading blank at the default min gap plays from 5.75s into the file.
+  // A line stamped 8000ms in the file is sung 2.25s after the track starts.
+  const payload = toPublicLyricsPayload(
+    'abc123',
+    {
+      synced: true,
+      lines: [
+        { startMs: 8000, text: 'first sung line' },
+        { startMs: 11_500, text: 'second sung line' },
+      ],
+    },
+    { cueInSec: 5.75 },
+  );
+  assert.deepEqual(payload.lines, [
+    { startMs: 2250, text: 'first sung line' },
+    { startMs: 5750, text: 'second sung line' },
+  ]);
+  assert.equal(payload.synced, true);
+});
+
+test('a line inside the trimmed head lands at the start, never before it', () => {
+  const payload = toPublicLyricsPayload(
+    'abc123',
+    { synced: true, lines: [{ startMs: 3000, text: 'count-in' }, { startMs: 9000, text: 'verse' }] },
+    { cueInSec: 5.75 },
+  );
+  assert.deepEqual(payload.lines.map((l) => l.startMs), [0, 3250]);
+});
+
+test('an untrimmed play keeps the file timings exactly', () => {
+  for (const cueInSec of [null, undefined]) {
+    assert.deepEqual(
+      toPublicLyricsPayload('abc123', { synced: true, lines: [{ startMs: 1234, text: 'line' }] }, { cueInSec })
+        .lines,
+      [{ startMs: 1234, text: 'line' }],
+    );
+  }
+});
+
+test('the station offset rides beside the lines, never folded into them', () => {
+  const payload = toPublicLyricsPayload(
+    'abc123',
+    { synced: true, lines: [{ startMs: 8000, text: 'line' }] },
+    { offsetMs: 2900, cueInSec: 2 },
+  );
+  assert.equal(payload.offsetMs, 2900);
+  assert.deepEqual(payload.lines, [{ startMs: 6000, text: 'line' }]);
+});

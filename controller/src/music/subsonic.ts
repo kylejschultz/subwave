@@ -705,26 +705,46 @@ export async function getLyrics(songId) {
 // `startMs` is milliseconds from track start with the entry-level `offset`
 // folded in (positive offset means lyrics appear sooner: start − offset,
 // clamped at 0). synced=false means the line timings are absent.
+//
+// THROWS when the server could not answer (transport, HTTP or API failure),
+// so a caller can tell "this track has no lyrics" from "the server is down".
+// Only Subsonic's "data not found" (70) is an answer: the song or its lyrics
+// do not exist. The listener lyrics route needs that difference; the analyzer
+// does not, and reads through getStructuredLyrics() below.
+export async function fetchStructuredLyrics(
+  songId,
+): Promise<{ synced: boolean; lines: Array<{ startMs: number; text: string }> } | null> {
+  let r;
+  try {
+    r = await call('getLyricsBySongId', { id: songId }, RETRY_FAST_TRANSPORT);
+  } catch (err) {
+    if ((err as { subsonicCode?: number })?.subsonicCode === 70) return null;
+    throw err;
+  }
+  const structured = r.lyricsList?.structuredLyrics;
+  if (!Array.isArray(structured) || structured.length === 0) return null;
+  // Several versions may exist (languages, synced + unsynced); only a synced
+  // one carries timings.
+  const chosen = structured.find((s) => s?.synced === true) ?? structured[0];
+  const synced = chosen?.synced === true;
+  const offset = Number.isFinite(chosen?.offset) ? Number(chosen.offset) : 0;
+  const lineArr = Array.isArray(chosen?.line) ? chosen.line : [];
+  const lines = lineArr.map((l) => {
+    const text = typeof l?.value === 'string' ? l.value : '';
+    const rawStart = Number(l?.start);
+    const startMs = Number.isFinite(rawStart) ? Math.max(0, rawStart - offset) : NaN;
+    return { startMs, text };
+  });
+  return { synced, lines };
+}
+
+// fetchStructuredLyrics with every failure read as "none indexed". The
+// analyzer's vocal-range pass treats both the same way.
 export async function getStructuredLyrics(
   songId,
 ): Promise<{ synced: boolean; lines: Array<{ startMs: number; text: string }> } | null> {
   try {
-    const r = await call('getLyricsBySongId', { id: songId }, RETRY_FAST_TRANSPORT);
-    const structured = r.lyricsList?.structuredLyrics;
-    if (!Array.isArray(structured) || structured.length === 0) return null;
-    // Several versions may exist (languages, synced + unsynced); only a synced
-    // one carries timings.
-    const chosen = structured.find((s) => s?.synced === true) ?? structured[0];
-    const synced = chosen?.synced === true;
-    const offset = Number.isFinite(chosen?.offset) ? Number(chosen.offset) : 0;
-    const lineArr = Array.isArray(chosen?.line) ? chosen.line : [];
-    const lines = lineArr.map((l) => {
-      const text = typeof l?.value === 'string' ? l.value : '';
-      const rawStart = Number(l?.start);
-      const startMs = Number.isFinite(rawStart) ? Math.max(0, rawStart - offset) : NaN;
-      return { startMs, text };
-    });
-    return { synced, lines };
+    return await fetchStructuredLyrics(songId);
   } catch {
     return null;
   }
