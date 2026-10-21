@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import { Minus, Plus, RotateCcw, SlidersHorizontal } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { useSkinCalm } from '@/components/skins/sharedHooks';
 import {
   LYRIC_OFFSET_MAX_MS,
   LYRIC_OFFSET_MIN_MS,
@@ -21,18 +22,26 @@ export interface LyricsDrawerProps {
 
 const OFFSET_VISIBLE_STORAGE_KEY = 'subwave:lyrics-offset-visible';
 
+// After the listener scrolls the lyrics themselves, the panel stops following
+// the sung line for this long, so reading back up a verse is not yanked away.
+const FOLLOW_PAUSE_MS = 6_000;
+
+const ICON_BUTTON =
+  'v3-focus grid h-8 w-8 shrink-0 cursor-pointer place-items-center border border-separator-soft bg-transparent text-ink disabled:cursor-default disabled:opacity-40';
+
+function Note({ children }: { children: ReactNode }) {
+  return <div className="text-[13px] leading-relaxed text-muted">{children}</div>;
+}
+
 export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: LyricsDrawerProps) {
   const [showOffset, setShowOffset] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLDivElement | null>(null);
-  const {
-    lyrics,
-    loading,
-    failed,
-    stale,
-    offsetMs,
-    activeLineIndex: active,
-    updateOffset,
-  } = useCurrentLyrics({ songId, trackStartedAt });
+  const userScrolledAt = useRef(0);
+  const followedOnce = useRef(false);
+  const calm = useSkinCalm();
+  const { status, lyrics, activeLineIndex: active, deviceOffsetMs, setDeviceOffsetMs, station } =
+    useCurrentLyrics({ songId, trackStartedAt });
 
   useEffect(() => {
     try {
@@ -41,8 +50,8 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
   }, []);
 
   const toggleOffset = () => {
-    setShowOffset(next => {
-      const visible = !next;
+    setShowOffset(prev => {
+      const visible = !prev;
       try {
         window.localStorage.setItem(OFFSET_VISIBLE_STORAGE_KEY, visible ? '1' : '0');
       } catch {}
@@ -50,43 +59,42 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
     });
   };
 
-  const onOffsetInput = (event: ChangeEvent<HTMLInputElement>) => {
-    updateOffset(Number(event.target.value));
-  };
+  const markUserScroll = useCallback(() => {
+    userScrolledAt.current = Date.now();
+  }, []);
 
   useEffect(() => {
-    if (active < 0) return;
-    activeRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }, [active]);
+    followedOnce.current = false;
+  }, [songId]);
+
+  // Follow the sung line inside the panel's own scroller. scrollIntoView would
+  // also move every scrolling ancestor, the drawer and the page included.
+  useEffect(() => {
+    const box = scrollRef.current;
+    const line = activeRef.current;
+    if (active < 0 || !box || !line) return;
+    if (Date.now() - userScrolledAt.current < FOLLOW_PAUSE_MS) return;
+    const boxRect = box.getBoundingClientRect();
+    const lineRect = line.getBoundingClientRect();
+    const top = box.scrollTop + (lineRect.top - boxRect.top) - (box.clientHeight - lineRect.height) / 2;
+    // The first jump on opening is instant; so is every one under reduced
+    // motion or lite mode.
+    const smooth = followedOnce.current && !calm;
+    followedOnce.current = true;
+    box.scrollTo({ top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto' });
+  }, [active, calm]);
 
   if (!songId) {
-    return (
-      <div className="text-[13px] leading-relaxed text-muted">
-        Lyrics are available for library tracks once the station has indexed them.
-      </div>
-    );
+    return <Note>Lyrics are available for library tracks once the station has indexed them.</Note>;
   }
-
-  // `stale` means the station is still answering for the previous track — we
-  // have no verdict for this one, so keep waiting rather than claiming it has
-  // no lyrics. The hook re-asks on its own.
-  if (loading || stale) {
-    return (
-      <div className="text-[13px] leading-relaxed text-muted">
-        Pulling lyrics from the library…
-      </div>
-    );
+  if (status === 'disabled') return <Note>Lyrics are switched off on this station.</Note>;
+  if (status === 'gone') return <Note>This song has left the air, so its lyrics are no longer available.</Note>;
+  if (status === 'unavailable') {
+    return <Note>Lyrics are not reachable right now. Trying again…</Note>;
   }
+  if (status !== 'ready' || !lyrics) return <Note>Pulling lyrics from the library…</Note>;
 
-  if (failed) {
-    return (
-      <div className="text-[13px] leading-relaxed text-muted">
-        Lyrics are not reachable right now.
-      </div>
-    );
-  }
-
-  if (!lyrics?.lines.length) {
+  if (!lyrics.lines.length) {
     return (
       <div>
         <div className="text-[9px] tracking-[0.3em] text-muted uppercase">No lyrics indexed</div>
@@ -105,30 +113,35 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
             <div className="truncate text-[14px] leading-tight font-semibold">{title || 'Now playing'}</div>
             {artist && <div className="mt-1 truncate text-[10px] tracking-[0.16em] text-muted uppercase">{artist}</div>}
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            {lyrics.synced && (
-              <>
-                <div className="v3-tab-num text-[9px] tracking-[0.18em] text-muted uppercase">Synced</div>
-                <button
-                  type="button"
-                  className={cn(
-                    'v3-focus grid h-7 w-7 place-items-center border border-separator-soft bg-transparent text-muted transition-colors',
-                    showOffset && 'border-ink bg-ink text-bg',
-                  )}
-                  onClick={toggleOffset}
-                  aria-pressed={showOffset}
-                  aria-label="Lyrics offset controls"
-                  title="Lyrics offset controls"
-                >
-                  <SlidersHorizontal size={15} strokeWidth={1.7} />
-                </button>
-              </>
-            )}
-          </div>
+          {lyrics.synced && (
+            <div className="flex shrink-0 items-center gap-2">
+              <div className="v3-tab-num text-[9px] tracking-[0.18em] text-muted uppercase">Synced</div>
+              <button
+                type="button"
+                className={cn(
+                  'v3-focus grid h-7 w-7 place-items-center border border-separator-soft bg-transparent text-muted transition-colors',
+                  showOffset && 'border-ink bg-ink text-bg',
+                )}
+                onClick={toggleOffset}
+                aria-pressed={showOffset}
+                aria-label="Lyrics timing controls"
+                title="Lyrics timing controls"
+              >
+                <SlidersHorizontal size={15} strokeWidth={1.7} />
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="v3-scroll mt-3 flex min-h-0 flex-1 flex-col overflow-y-auto pb-4">
+      <div
+        ref={scrollRef}
+        className="v3-scroll mt-3 flex min-h-0 flex-1 flex-col overflow-y-auto pb-4"
+        onWheel={markUserScroll}
+        onTouchMove={markUserScroll}
+        onPointerDown={markUserScroll}
+        onKeyDown={markUserScroll}
+      >
         {lyrics.lines.map((line, index) => {
           const isActive = index === active;
           return (
@@ -150,20 +163,17 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
       </div>
 
       {lyrics.synced && showOffset && (
-        <div
-          className="shrink-0 border-t border-separator-soft pt-3"
-          data-lyric-offset
-        >
+        <div className="shrink-0 border-t border-separator-soft pt-3">
           <div className="mb-2 flex items-center justify-between gap-3">
-            <div className="text-[9px] tracking-[0.28em] text-muted uppercase">Track offset</div>
-            <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(offsetMs)}</div>
+            <div className="text-[9px] tracking-[0.28em] text-muted uppercase">This device</div>
+            <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(deviceOffsetMs)}</div>
           </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              className="v3-focus grid h-8 w-8 shrink-0 cursor-pointer place-items-center border border-separator-soft bg-transparent text-ink"
-              onClick={() => updateOffset(offsetMs - LYRIC_OFFSET_NUDGE_MS)}
-              aria-label="Delay lyrics"
+              className={ICON_BUTTON}
+              onClick={() => setDeviceOffsetMs(deviceOffsetMs - LYRIC_OFFSET_NUDGE_MS)}
+              aria-label="Delay lyrics on this device"
               title="Delay lyrics"
             >
               <Minus size={14} strokeWidth={1.8} />
@@ -173,30 +183,83 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
               min={LYRIC_OFFSET_MIN_MS}
               max={LYRIC_OFFSET_MAX_MS}
               step={LYRIC_OFFSET_STEP_MS}
-              value={offsetMs}
-              onChange={onOffsetInput}
-              aria-label="Track lyric offset"
-              className="h-8 min-w-0 flex-1 accent-[var(--accent)]"
+              value={deviceOffsetMs}
+              onChange={(event: ChangeEvent<HTMLInputElement>) => setDeviceOffsetMs(Number(event.target.value))}
+              aria-label="Lyrics timing on this device"
+              className="h-8 min-w-0 flex-1 accent-[var(--accent)] opacity-70"
             />
             <button
               type="button"
-              className="v3-focus grid h-8 w-8 shrink-0 cursor-pointer place-items-center border border-separator-soft bg-transparent text-ink"
-              onClick={() => updateOffset(offsetMs + LYRIC_OFFSET_NUDGE_MS)}
-              aria-label="Advance lyrics"
+              className={ICON_BUTTON}
+              onClick={() => setDeviceOffsetMs(deviceOffsetMs + LYRIC_OFFSET_NUDGE_MS)}
+              aria-label="Advance lyrics on this device"
               title="Advance lyrics"
             >
               <Plus size={14} strokeWidth={1.8} />
             </button>
             <button
               type="button"
-              className="v3-focus grid h-8 w-8 shrink-0 cursor-pointer place-items-center border border-separator-soft bg-transparent text-muted"
-              onClick={() => updateOffset(0)}
-              aria-label="Reset lyrics offset"
-              title="Reset lyrics offset"
+              className={cn(ICON_BUTTON, 'text-muted')}
+              onClick={() => setDeviceOffsetMs(0)}
+              aria-label="Reset lyrics timing on this device"
+              title="Reset"
             >
               <RotateCcw size={14} strokeWidth={1.8} />
             </button>
           </div>
+          <div className="mt-1 text-[10px] leading-snug text-muted">Only changes what this browser shows.</div>
+
+          {station.canTune && (
+            <div className="mt-4 border-t border-separator-soft pt-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-[9px] tracking-[0.28em] text-muted uppercase">Station · this track</div>
+                <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(station.offsetMs)}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className={ICON_BUTTON}
+                  onClick={() => station.set(station.offsetMs - LYRIC_OFFSET_NUDGE_MS)}
+                  disabled={station.saving}
+                  aria-label="Delay this track's lyrics for every listener"
+                  title="Delay lyrics"
+                >
+                  <Minus size={14} strokeWidth={1.8} />
+                </button>
+                <button
+                  type="button"
+                  className={ICON_BUTTON}
+                  onClick={() => station.set(station.offsetMs + LYRIC_OFFSET_NUDGE_MS)}
+                  disabled={station.saving}
+                  aria-label="Advance this track's lyrics for every listener"
+                  title="Advance lyrics"
+                >
+                  <Plus size={14} strokeWidth={1.8} />
+                </button>
+                <button
+                  type="button"
+                  className={cn(ICON_BUTTON, 'text-muted')}
+                  onClick={() => station.set(0)}
+                  disabled={station.saving || station.offsetMs === 0}
+                  aria-label="Clear this track's station timing"
+                  title="Clear"
+                >
+                  <RotateCcw size={14} strokeWidth={1.8} />
+                </button>
+                <button
+                  type="button"
+                  className="v3-focus ml-auto h-8 cursor-pointer border border-ink bg-ink px-3 text-[10px] tracking-[0.2em] text-bg uppercase disabled:cursor-default disabled:opacity-40"
+                  onClick={() => void station.save()}
+                  disabled={!station.dirty || station.saving}
+                >
+                  {station.saving ? 'Saving…' : 'Save'}
+                </button>
+              </div>
+              <div className="mt-1 text-[10px] leading-snug text-muted" role={station.error ? 'alert' : undefined}>
+                {station.error ?? 'Fixes this track’s lyric file for every listener. You are signed in as the operator.'}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

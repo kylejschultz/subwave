@@ -3,6 +3,7 @@
 import { Advanced } from './section-chrome';
 import { SectionHeader, SaveBar, type SectionProps } from './shared';
 import { LikesHeartCard, LikesInfluenceCard, likesMetrics, likesSavePayload } from './LikesSection';
+import { LyricsCard, lyricsMetrics, lyricsSavePayload } from './LyricsSection';
 import { ScrobbleCards, scrobbleReadiness } from './ScrobbleSection';
 
 interface ListenersSectionProps extends SectionProps {
@@ -31,6 +32,7 @@ export function ListenersSection(props: ListenersSectionProps) {
         </>}
         metrics={[
           ...likesMetrics(data),
+          ...lyricsMetrics(data),
           { n: lfReady ? 'on' : 'off', l: 'last.fm', accent: lfReady },
           { n: lbReady ? 'on' : 'off', l: 'listenbrainz', accent: lbReady },
           { n: ndReady ? 'on' : 'off', l: 'navidrome', accent: ndReady },
@@ -38,6 +40,7 @@ export function ListenersSection(props: ListenersSectionProps) {
       />
 
       <LikesHeartCard {...props} />
+      <LyricsCard {...props} />
       <ScrobbleCards {...props} />
 
       <Advanced note="how listener taste feeds back into track selection">
@@ -45,12 +48,12 @@ export function ListenersSection(props: ListenersSectionProps) {
       </Advanced>
 
       <SaveBar
-        note="Likes apply from the next pick, no restart needed."
+        note="Likes apply from the next pick and the Lyrics panel from the next poll, no restart needed."
         busy={busy}
-        onSave={() => saveSettings(likesSavePayload(form.likes))}
-        saveLabel="Save likes"
+        onSave={() => saveSettings({ ...likesSavePayload(form.likes), ...lyricsSavePayload(form.lyrics) })}
+        saveLabel="Save likes & lyrics"
         errors={fieldErrors}
-        ownedKeys={['likes']}
+        ownedKeys={['likes', 'lyrics']}
       />
     </>
   );

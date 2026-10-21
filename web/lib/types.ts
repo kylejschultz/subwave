@@ -169,19 +169,6 @@ export interface QueueEntry {
   [key: string]: unknown;
 }
 
-export interface PublicLyricLine {
-  startMs: number | null;
-  text: string;
-}
-
-export interface PublicLyricsPayload {
-  songId: string | null;
-  synced: boolean;
-  /** Add this to measured playback elapsed time before choosing the active line. */
-  offsetMs: number;
-  lines: PublicLyricLine[];
-}
-
 /** Status returned by `/request/:id`. */
 export type RequestStatus = 'pending' | 'resolved' | 'failed' | 'unknown';
 
@@ -215,6 +202,8 @@ export interface StationState {
   /** Operator player defaults. `skin` indexes components/skins;
    *  `tuneInOverlay` gates the tap-to-tune gate (default on). */
   ui?: { boothBuddy?: boolean; skin?: string; tuneInOverlay?: boolean };
+  /** Whether the operator has the Lyrics panel on. Absent on an older controller. */
+  lyrics?: { enabled?: boolean };
   /** Private-station flags (#478) — booleans only, never credentials.
    *  `privatePlayer` swaps the player pages for a "private station" screen;
    *  `listenerAuth` means the mounts demand the shared listener password

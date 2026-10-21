@@ -16,8 +16,9 @@ import type {
   SchedulePayload,
   SessionPayload,
   StationState,
-  PublicLyricsPayload,
 } from '@/lib/types';
+import { getStationAuthToken } from '@/lib/stationAuth';
+import { publicLyricsPayloadSchema, type PublicLyricsPayload } from '@/lib/schemas.generated';
 
 export interface ThemesPayload {
   /** The effective theme — what a client should actually paint. */
@@ -57,11 +58,15 @@ export interface LikeStatus {
   count?: number;
 }
 
-export interface LyricOffsetResult {
-  ok?: boolean;
-  songId?: string | null;
-  offsetMs?: number;
-}
+/** How `GET /lyrics/current` answered. `unavailable` is the only kind worth
+ *  asking again: the music server (or the network) did not answer. */
+export type LyricsResult =
+  | { kind: 'ok'; payload: PublicLyricsPayload }
+  /** The operator has the Lyrics panel switched off. */
+  | { kind: 'disabled' }
+  /** The track has left the station's recent-play window. */
+  | { kind: 'gone' }
+  | { kind: 'unavailable'; retryAfterSec: number | null };
 
 export interface StationClient {
   origin: StationOrigin;
@@ -84,12 +89,9 @@ export interface StationClient {
   likeCurrent(songId: string): Promise<LikeResult | null>;
   /** null on network error. */
   likeStatus(): Promise<LikeStatus | null>;
-  /** Structured lyrics for the current library track. `clientId` only selects that
-   *  listener/player's saved per-track timing correction. null on network error. */
-  currentLyrics(clientId?: string): Promise<PublicLyricsPayload | null>;
-  /** Persist a listener/player-scoped timing correction for the current track.
-   *  Positive offset means the player should advance lyrics sooner. */
-  setCurrentLyricOffset(songId: string, clientId: string, offsetMs: number): Promise<LyricOffsetResult | null>;
+  /** Lyrics for the track this listener is hearing (now-playing's
+   *  `subsonic_id`). Never throws. */
+  currentLyrics(songId: string): Promise<LyricsResult>;
   /** One-shot audience beacon. Best-effort: never throws, never blocks. */
   beacon(payload: BeaconPayload): void;
   /** null on any failure; callers treat that as "configured" and stay put. */
@@ -155,25 +157,25 @@ export function createStationClient(origin: StationOrigin): StationClient {
         return null;
       }
     },
-    currentLyrics: async (clientId) => {
+    currentLyrics: async (songId) => {
       try {
-        const qs = clientId ? `?clientId=${encodeURIComponent(clientId)}` : '';
-        const r = await fetch(`${api}/lyrics/current${qs}`, { cache: 'no-store' });
-        return r.ok ? await json<PublicLyricsPayload>(r) : null;
-      } catch {
-        return null;
-      }
-    },
-    setCurrentLyricOffset: async (songId, clientId, offsetMs) => {
-      try {
-        const r = await fetch(`${api}/lyrics/current/offset`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ songId, clientId, offsetMs }),
+        // A private station gates this read on the station password, which the
+        // gate stored when the listener unlocked the player.
+        const token = getStationAuthToken();
+        const r = await fetch(`${api}/lyrics/current?songId=${encodeURIComponent(songId)}`, {
+          cache: 'no-store',
+          headers: token ? { 'x-station-auth': token } : undefined,
         });
-        return r.ok ? await json<LyricOffsetResult>(r) : null;
+        if (r.status === 403) return { kind: 'disabled' };
+        if (r.status === 409) return { kind: 'gone' };
+        if (!r.ok) {
+          const retryAfter = Number(r.headers.get('Retry-After'));
+          return { kind: 'unavailable', retryAfterSec: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null };
+        }
+        const parsed = publicLyricsPayloadSchema.safeParse(await r.json());
+        return parsed.success ? { kind: 'ok', payload: parsed.data } : { kind: 'unavailable', retryAfterSec: null };
       } catch {
-        return null;
+        return { kind: 'unavailable', retryAfterSec: null };
       }
     },
     beacon: payload => {

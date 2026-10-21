@@ -265,6 +265,11 @@ export interface LikesForm {
   windowDays: string;
 }
 
+/** The listener Lyrics panel — `settings.lyrics`. */
+export interface LyricsForm {
+  enabled: boolean;
+}
+
 export interface ArchiveForm {
   enabled: boolean;
   bitrate: string;
@@ -399,6 +404,7 @@ export interface FormState {
   scrobble: ScrobbleForm;
   privacy: PrivacyForm;
   likes: LikesForm;
+  lyrics: LyricsForm;
   requests: RequestsForm;
 }
 
@@ -554,6 +560,9 @@ export interface SettingsData {
       influenceDj?: boolean;
       maxTracks?: number;
       windowDays?: number;
+    };
+    lyrics?: {
+      enabled?: boolean;
     };
   };
   tts?: {

@@ -1,45 +1,73 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useStationClient } from '@/lib/stationClient';
-import type { PublicLyricsPayload } from '@/lib/types';
+// The shared lyrics hook behind a skin's Lyrics panel. It asks for the track
+// the LISTENER is hearing (the feed's now-playing, a stream buffer behind the
+// live edge), retries only when the station could not answer, and combines two
+// timing corrections: the station's, which the operator sets once per track for
+// everyone, and this device's own nudge, which never leaves the browser.
 
-export const LYRIC_OFFSET_MIN_MS = -30000;
-export const LYRIC_OFFSET_MAX_MS = 30000;
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAdminAuth } from '@/lib/adminAuth';
+import { useStationClient } from '@/lib/stationClient';
+import { DEFAULT_STATION_ORIGIN } from '@/lib/stationOrigin';
+import {
+  LYRIC_OFFSET_MAX_MS,
+  LYRIC_OFFSET_MIN_MS,
+  type PublicLyricsPayload,
+} from '@/lib/schemas.generated';
+
+export { LYRIC_OFFSET_MAX_MS, LYRIC_OFFSET_MIN_MS };
 export const LYRIC_OFFSET_STEP_MS = 50;
 export const LYRIC_OFFSET_NUDGE_MS = 100;
 
-const OFFSET_STORAGE_KEY = 'subwave:lyrics-offset-ms';
-const OFFSET_CLIENT_STORAGE_KEY = 'subwave:lyrics-offset-client-id';
+// One value for every track: a device's delay (Bluetooth, a receiver) is the
+// same whatever is playing. A track's own mistiming is the station's to fix.
+const DEVICE_OFFSET_STORAGE_KEY = 'subwave:lyrics-device-offset-ms';
 
-// Re-ask at a low rate while the drawer is open and the station is still
-// answering for the live-edge track. Listener buffers are operator-configured
-// and can outlast any fixed retry window, so this intentionally has no cap.
-const STALE_RETRY_MS = 5000;
+// Backoff for a station that did not answer: 5s, 10s, 20s, 40s, then every
+// 60s while the panel stays open. Never sooner than the station's Retry-After.
+const RETRY_BASE_MS = 5_000;
+const RETRY_MAX_MS = 60_000;
+
+export type LyricsStatus =
+  /** No library track to ask about. */
+  | 'idle'
+  | 'loading'
+  | 'ready'
+  /** The station or the network did not answer; the hook is asking again. */
+  | 'unavailable'
+  /** The operator has the Lyrics panel switched off. */
+  | 'disabled'
+  /** The track left the station's recent-play window before we asked. */
+  | 'gone';
 
 export interface UseCurrentLyricsOptions {
-  /** Current Subsonic/library song id from now-playing. */
+  /** The listener's now-playing `subsonic_id`. */
   songId?: string | null;
-  /** Millisecond epoch timestamp from now-playing; used for player elapsed time. */
+  /** When the listener's audio of this track began (ms epoch, listener time). */
   trackStartedAt: number | null;
 }
 
-export interface CurrentLyricsState {
-  lyrics: PublicLyricsPayload | null;
-  loading: boolean;
-  failed: boolean;
-  /**
-   * The station answered for a different track than the one we asked about, so
-   * we have no verdict yet. Distinct from `failed` (the call errored) and from
-   * an empty payload (the track genuinely has no lyrics) — render it as "still
-   * resolving", never as "no lyrics".
-   */
-  stale: boolean;
-  /** Add this to measured elapsed time. Positive values advance lyrics sooner. */
+export interface StationOffsetControl {
+  /** True when this browser is signed in to this station's admin console. */
+  canTune: boolean;
+  /** The value in force for the preview: the unsaved draft, else the saved one. */
   offsetMs: number;
-  elapsedMs: number;
+  savedMs: number;
+  dirty: boolean;
+  saving: boolean;
+  error: string | null;
+  set: (next: number) => void;
+  save: () => Promise<void>;
+}
+
+export interface CurrentLyricsState {
+  status: LyricsStatus;
+  lyrics: PublicLyricsPayload | null;
   activeLineIndex: number;
-  updateOffset: (next: number) => void;
+  deviceOffsetMs: number;
+  setDeviceOffsetMs: (next: number) => void;
+  station: StationOffsetControl;
 }
 
 export function clampLyricOffsetMs(value: number): number {
@@ -52,14 +80,14 @@ export function formatLyricOffset(ms: number): string {
   return `${ms > 0 ? '+' : '-'}${(Math.abs(ms) / 1000).toFixed(2)}s`;
 }
 
+/** The line being sung `elapsedMs` into the track, -1 before the first. */
 export function activeLyricLineIndex(
   lyrics: PublicLyricsPayload | null,
   elapsedMs: number,
   offsetMs: number,
 ): number {
   if (!lyrics?.synced) return -1;
-  // Keep source lyric timestamps immutable; apply the player correction only
-  // when selecting the active line.
+  // The corrections apply to the clock, never to the lines.
   const adjustedElapsedMs = Math.max(0, elapsedMs + offsetMs);
   let active = -1;
   for (let i = 0; i < lyrics.lines.length; i += 1) {
@@ -71,167 +99,165 @@ export function activeLyricLineIndex(
   return active;
 }
 
-function offsetStorageKey(songId: string): string {
-  return `${OFFSET_STORAGE_KEY}:${songId}`;
+/** How long to wait before asking again after the `attempt`th miss (0-based). */
+export function lyricsRetryDelayMs(attempt: number, retryAfterSec: number | null): number {
+  const backoff = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt));
+  const floor = retryAfterSec != null && retryAfterSec > 0 ? retryAfterSec * 1000 : 0;
+  return Math.max(backoff, Math.min(floor, RETRY_MAX_MS));
 }
 
-function createFallbackClientId(): string {
-  return `sw_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
-}
-
-function readLyricOffsetClientId(): string {
+function readDeviceOffset(): number {
   try {
-    const stored = window.localStorage.getItem(OFFSET_CLIENT_STORAGE_KEY);
-    if (stored) return stored;
-    const next = window.crypto?.randomUUID?.() ?? createFallbackClientId();
-    window.localStorage.setItem(OFFSET_CLIENT_STORAGE_KEY, next);
-    return next;
+    const stored = window.localStorage.getItem(DEVICE_OFFSET_STORAGE_KEY);
+    return stored == null ? 0 : clampLyricOffsetMs(Number(stored));
   } catch {
-    return createFallbackClientId();
+    return 0;
   }
 }
 
-function readStoredOffset(songId: string): number | null {
+function writeDeviceOffset(offsetMs: number): void {
   try {
-    const stored = window.localStorage.getItem(offsetStorageKey(songId));
-    return stored == null ? null : clampLyricOffsetMs(Number(stored));
-  } catch {
-    return null;
-  }
-}
-
-function writeStoredOffset(songId: string, offsetMs: number): void {
-  try {
-    window.localStorage.setItem(offsetStorageKey(songId), String(clampLyricOffsetMs(offsetMs)));
+    if (offsetMs === 0) window.localStorage.removeItem(DEVICE_OFFSET_STORAGE_KEY);
+    else window.localStorage.setItem(DEVICE_OFFSET_STORAGE_KEY, String(offsetMs));
   } catch {}
 }
 
-export function useCurrentLyrics({
-  songId,
-  trackStartedAt,
-}: UseCurrentLyricsOptions): CurrentLyricsState {
+interface Answer {
+  songId: string | null;
+  status: LyricsStatus;
+  lyrics: PublicLyricsPayload | null;
+}
+
+export function useCurrentLyrics({ songId, trackStartedAt }: UseCurrentLyricsOptions): CurrentLyricsState {
   const client = useStationClient();
-  const [lyrics, setLyrics] = useState<PublicLyricsPayload | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const { auth, adminFetch } = useAdminAuth();
+  const id = songId || null;
+  const [answer, setAnswer] = useState<Answer>({ songId: null, status: 'idle', lyrics: null });
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [offsetMs, setOffsetMs] = useState(0);
-  const [stale, setStale] = useState(false);
-  const [retryTick, setRetryTick] = useState(0);
-  const clientIdRef = useRef<string>('');
-  const loadedOffsetSongRef = useRef<string | null>(null);
-  // What the station is known to hold for this track. The save effect writes
-  // only when the local offset diverges from it, so simply loading a track
-  // never PUTs the value straight back.
-  const savedOffsetRef = useRef<number | null>(null);
+  const [deviceOffsetMs, setDeviceOffsetState] = useState(0);
+  const [draft, setDraft] = useState<{ songId: string; offsetMs: number } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    clientIdRef.current = readLyricOffsetClientId();
+    setDeviceOffsetState(readDeviceOffset());
   }, []);
 
-  const updateOffset = useCallback((next: number) => {
-    const clamped = clampLyricOffsetMs(next);
-    setOffsetMs(clamped);
-    if (songId) writeStoredOffset(songId, clamped);
-  }, [songId]);
-
   useEffect(() => {
-    let cancelled = false;
-    setLyrics(null);
-    setFailed(false);
-    setStale(false);
-    loadedOffsetSongRef.current = null;
-    savedOffsetRef.current = null;
-    if (!songId) {
-      setLoading(false);
-      setOffsetMs(0);
+    setDraft(null);
+    setSaveError(null);
+    if (!id) {
+      setAnswer({ songId: null, status: 'idle', lyrics: null });
       return;
     }
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempt = 0;
+    setAnswer({ songId: id, status: 'loading', lyrics: null });
+    const ask = async () => {
+      const result = await client.currentLyrics(id);
+      if (cancelled) return;
+      if (result.kind === 'ok') {
+        // The station answers for the id it was asked about; anything else
+        // cannot be shown as this track's lyrics.
+        setAnswer(result.payload.songId === id
+          ? { songId: id, status: 'ready', lyrics: result.payload }
+          : { songId: id, status: 'gone', lyrics: null });
+        return;
+      }
+      if (result.kind !== 'unavailable') {
+        setAnswer({ songId: id, status: result.kind, lyrics: null });
+        return;
+      }
+      setAnswer({ songId: id, status: 'unavailable', lyrics: null });
+      timer = window.setTimeout(ask, lyricsRetryDelayMs(attempt, result.retryAfterSec));
+      attempt += 1;
+    };
+    void ask();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [client, id]);
 
-    setLoading(true);
-    const clientId = clientIdRef.current || readLyricOffsetClientId();
-    clientIdRef.current = clientId;
-    client.currentLyrics(clientId)
-      .then((payload) => {
-        if (cancelled) return;
-        // `/lyrics/current` answers for whatever is on air at the live edge,
-        // while the station feed deliberately holds us ~bufferSeconds behind it.
-        // So a well-formed answer for another track is routine around every
-        // transition, and means "ask again", not "this track has no lyrics".
-        const matched = payload != null && payload.songId === songId;
-        setLyrics(matched ? payload : null);
-        if (matched) {
-          const apiOffset = clampLyricOffsetMs(payload.offsetMs ?? 0);
-          const storedOffset = readStoredOffset(songId);
-          const nextOffset = apiOffset === 0 && storedOffset != null ? storedOffset : apiOffset;
-          loadedOffsetSongRef.current = songId;
-          // The station holds apiOffset; nextOffset may be a local value it has
-          // never seen, in which case the save effect below syncs it up once.
-          savedOffsetRef.current = apiOffset;
-          setOffsetMs(nextOffset);
-        } else {
-          setOffsetMs(0);
-        }
-        setFailed(payload == null);
-        setStale(payload != null && !matched);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
-    return () => { cancelled = true; };
-  }, [client, songId, retryTick]);
-
-  // Re-ask while the station is answering for a different track. This hook is
-  // mounted only while the drawer is open, so closing it cancels the poll.
-  useEffect(() => {
-    if (!stale) return;
-    const id = window.setTimeout(() => {
-      setRetryTick((n) => n + 1);
-    }, STALE_RETRY_MS);
-    return () => window.clearTimeout(id);
-  }, [stale, retryTick]);
-
-  useEffect(() => {
-    if (!songId || !lyrics?.synced || loadedOffsetSongRef.current !== songId) return;
-    // Only write a real change. Without this the load itself sets `offsetMs`,
-    // which re-runs this effect and PUTs the just-loaded value straight back —
-    // a network write plus a row upsert per listener on every single track.
-    if (savedOffsetRef.current === offsetMs) return;
-    const id = window.setTimeout(() => {
-      client.setCurrentLyricOffset(songId, clientIdRef.current, offsetMs)
-        .then((saved) => {
-          if (saved?.songId === songId && typeof saved.offsetMs === 'number') {
-            const clamped = clampLyricOffsetMs(saved.offsetMs);
-            savedOffsetRef.current = clamped;
-            setOffsetMs(clamped);
-            writeStoredOffset(songId, clamped);
-          }
-        });
-    }, 350);
-    return () => window.clearTimeout(id);
-  }, [client, songId, lyrics?.synced, offsetMs]);
+  // An answer for a track we have moved on from is never shown, even for the
+  // render before the effect above resets it.
+  const current = answer.songId === id ? answer : { songId: id, status: id ? 'loading' as const : 'idle' as const, lyrics: null };
+  const lyrics = current.lyrics;
 
   useEffect(() => {
     if (!lyrics?.synced) return;
-    const id = window.setInterval(() => setNowMs(Date.now()), 500);
-    return () => window.clearInterval(id);
+    const timer = window.setInterval(() => setNowMs(Date.now()), 500);
+    return () => window.clearInterval(timer);
   }, [lyrics?.synced, trackStartedAt]);
 
+  const setDeviceOffsetMs = useCallback((next: number) => {
+    const clamped = clampLyricOffsetMs(next);
+    setDeviceOffsetState(clamped);
+    writeDeviceOffset(clamped);
+  }, []);
+
+  // The operator control is offered only for the station this page belongs
+  // to: the admin credential in this browser is that install's, and a player
+  // pointed at another station must never send it there.
+  const canTune = !!auth && client.origin.apiUrl === DEFAULT_STATION_ORIGIN.apiUrl;
+  const savedMs = lyrics?.offsetMs ?? 0;
+  const draftMs = draft && draft.songId === id ? draft.offsetMs : null;
+  const stationMs = draftMs ?? savedMs;
+
+  const setStation = useCallback((next: number) => {
+    if (!id) return;
+    setSaveError(null);
+    setDraft({ songId: id, offsetMs: clampLyricOffsetMs(next) });
+  }, [id]);
+
+  const saveStation = useCallback(async () => {
+    if (!id || draftMs == null) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const res = await adminFetch(`/lyrics/offsets/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offsetMs: draftMs }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null) as { error?: string } | null;
+        setSaveError(res.status === 401 ? 'Sign in to the admin console again to save.' : body?.error || 'Could not save.');
+        return;
+      }
+      setAnswer((prev) => (prev.songId === id && prev.lyrics
+        ? { ...prev, lyrics: { ...prev.lyrics, offsetMs: draftMs } }
+        : prev));
+      setDraft(null);
+    } catch {
+      setSaveError('Could not reach the station.');
+    } finally {
+      setSaving(false);
+    }
+  }, [adminFetch, draftMs, id]);
+
   const elapsedMs = trackStartedAt == null ? 0 : Math.max(0, nowMs - trackStartedAt);
-  const activeLine = useMemo(
-    () => activeLyricLineIndex(lyrics, elapsedMs, offsetMs),
-    [lyrics, elapsedMs, offsetMs],
+  const activeLineIndex = useMemo(
+    () => activeLyricLineIndex(lyrics, elapsedMs, stationMs + deviceOffsetMs),
+    [lyrics, elapsedMs, stationMs, deviceOffsetMs],
   );
 
   return {
+    status: current.status,
     lyrics,
-    loading,
-    failed,
-    stale,
-    offsetMs,
-    elapsedMs,
-    activeLineIndex: activeLine,
-    updateOffset,
+    activeLineIndex,
+    deviceOffsetMs,
+    setDeviceOffsetMs,
+    station: {
+      canTune,
+      offsetMs: stationMs,
+      savedMs,
+      dirty: draftMs != null && draftMs !== savedMs,
+      saving,
+      error: saveError,
+      set: setStation,
+      save: saveStation,
+    },
   };
 }

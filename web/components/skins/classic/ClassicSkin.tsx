@@ -50,6 +50,8 @@ const TIMELINE_ICON = <History size={18} strokeWidth={1.5} />;
 const BOOTH_ICON = <Mic size={18} strokeWidth={1.5} />;
 const SCHEDULE_ICON = <CalendarClock size={18} strokeWidth={1.5} />;
 const LYRICS_ICON = <Captions size={18} strokeWidth={1.5} />;
+// The rail without its Lyrics entry, for a station that has the panel off.
+const HIDE_LYRICS: readonly PlayerDrawer[] = ['lyrics'];
 
 export default function ClassicSkin({ portalNode }: SkinProps) {
   const client = useStationClient();
@@ -110,6 +112,13 @@ export default function ClassicSkin({ portalNode }: SkinProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
+  // The operator's switch rides GET /state. Off, the panel has no entry point,
+  // and one already open closes rather than sit on a refusal.
+  const lyricsOn = state.lyrics?.enabled === true;
+  useEffect(() => {
+    if (!lyricsOn && drawer === 'lyrics') setDrawer(null);
+  }, [lyricsOn, drawer]);
+
   // Haptics live here rather than at each call site so every entry point
   // (DotRail, shortcut, palette, swipe-dismiss) feels the same.
   const prevDrawerRef = useRef<PlayerDrawer | null>(drawer);
@@ -152,8 +161,7 @@ export default function ClassicSkin({ portalNode }: SkinProps) {
       '2': () => setDrawer('booth'),
       '3': () => setDrawer('request'),
       '4': () => setDrawer('schedule'),
-      '5': () => setDrawer('lyrics'),
-      l: () => setDrawer('lyrics'),
+      ...(lyricsOn ? { '5': () => setDrawer('lyrics'), l: () => setDrawer('lyrics') } : {}),
       r: () => setDrawer('request'),
       '?': () => setShortcutsOpen(true),
       'mod+k': () => setPaletteOpen(o => !o),
@@ -215,7 +223,7 @@ export default function ClassicSkin({ portalNode }: SkinProps) {
         duration={nowPlaying?.duration ?? 0}
       />
 
-      <DotRail counts={dotRailCounts} active={drawer} onSelect={setDrawer} />
+      <DotRail counts={dotRailCounts} hidden={lyricsOn ? undefined : HIDE_LYRICS} active={drawer} onSelect={setDrawer} />
 
       <TransportBar
         tunedIn={tunedIn}
@@ -281,12 +289,14 @@ export default function ClassicSkin({ portalNode }: SkinProps) {
         onOpenDrawer={setDrawer}
         onToggleMute={toggleMute}
         onShowShortcuts={() => setShortcutsOpen(true)}
+        lyrics={lyricsOn}
       />
 
       <ShortcutsDialog
         open={shortcutsOpen}
         onOpenChange={setShortcutsOpen}
         container={portalNode}
+        lyrics={lyricsOn}
       />
     </>
   );
