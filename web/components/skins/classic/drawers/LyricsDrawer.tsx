@@ -136,7 +136,7 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
 
       <div
         ref={scrollRef}
-        className="v3-scroll mt-3 flex min-h-0 flex-1 flex-col overflow-y-auto pb-4"
+        className="v3-scroll mt-3 flex min-h-24 flex-1 flex-col overflow-y-auto pb-4"
         onWheel={markUserScroll}
         onTouchMove={markUserScroll}
         onPointerDown={markUserScroll}
@@ -163,9 +163,11 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
       </div>
 
       {lyrics.synced && showOffset && (
-        <div className="shrink-0 border-t border-separator-soft pt-3">
-          <div className="mb-2 flex items-center justify-between gap-3">
-            <div className="text-[9px] tracking-[0.28em] text-muted uppercase">This device</div>
+        <div className="shrink-0 border-t border-separator-soft pt-2">
+          <div className="mb-1.5 flex items-center justify-between gap-3">
+            <div className="text-[9px] tracking-[0.28em] text-muted uppercase" title="Only changes what this browser shows">
+              This device
+            </div>
             <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(deviceOffsetMs)}</div>
           </div>
           <div className="flex items-center gap-2">
@@ -207,12 +209,16 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
               <RotateCcw size={14} strokeWidth={1.8} />
             </button>
           </div>
-          <div className="mt-1 text-[10px] leading-snug text-muted">Only changes what this browser shows.</div>
 
           {station.canTune && (
-            <div className="mt-4 border-t border-separator-soft pt-3">
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="text-[9px] tracking-[0.28em] text-muted uppercase">Station · this track</div>
+            <div className="mt-2 border-t border-separator-soft pt-2">
+              <div className="mb-1.5 flex items-center justify-between gap-3">
+                <div
+                  className="text-[9px] tracking-[0.28em] text-muted uppercase"
+                  title="Fixes this track's lyric file for every listener. Shown because this browser is signed in as the operator."
+                >
+                  Station · this track
+                </div>
                 <div className="v3-tab-num shrink-0 text-[11px] tracking-[0.1em] text-ink">{formatLyricOffset(station.offsetMs)}</div>
               </div>
               <div className="flex items-center gap-2">
@@ -255,9 +261,9 @@ export default function LyricsDrawer({ songId, title, artist, trackStartedAt }: 
                   {station.saving ? 'Saving…' : 'Save'}
                 </button>
               </div>
-              <div className="mt-1 text-[10px] leading-snug text-muted" role={station.error ? 'alert' : undefined}>
-                {station.error ?? 'Fixes this track’s lyric file for every listener. You are signed in as the operator.'}
-              </div>
+              {station.error && (
+                <div className="mt-1 text-[10px] leading-snug text-vermilion" role="alert">{station.error}</div>
+              )}
             </div>
           )}
         </div>

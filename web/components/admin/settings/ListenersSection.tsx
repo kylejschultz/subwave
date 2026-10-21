@@ -28,7 +28,8 @@ export function ListenersSection(props: ListenersSectionProps) {
           One tap on the player hearts the track on air: it lands in Library → Tracks → Liked,
           optionally as a Navidrome star, and optionally as a taste signal for the DJ. No listener
           accounts, and the raw IP is never stored. Scrobbling reports what the station airs to
-          Last.fm, ListenBrainz and your own Navidrome; each backend is independent.
+          Last.fm, ListenBrainz and your own Navidrome; each backend is independent. The Lyrics
+          panel is the one thing here that flows the other way: the song&apos;s words, shown to them.
         </>}
         metrics={[
           ...likesMetrics(data),
