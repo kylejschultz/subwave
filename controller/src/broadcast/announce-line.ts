@@ -1,36 +1,10 @@
-// Composes the fixed announce-mode link line in CODE rather than asking the
-// model to produce it: a model cannot reliably hold to an exact fixed string,
-// and it cannot alternate with a line it is never shown — the agent path
-// writes the link before the pick after it airs, and the scripted path never
-// carries the previous link forward at all. Per the station's own posture (fix
-// shape in code, don't just instruct the model harder), both call sites
-// compose the line here and only ask the model whether to speak.
-//
-// PURE — the alternation is derived from the line that last AIRED, handed in
-// by the caller (queue.getLastLinkText(), written by onSpoken once the clip
-// reached the stream). It used to be a module-level counter advanced at
-// composition time, which is not the same thing: three routine paths consume a
-// composed link without airing it — a model writing a `say` when the event
-// ordered silence, trimLinkToIntro dropping the line on a track whose vocals
-// enter under 2.5s, and enqueuePick refusing the pick (dedup / never-play) —
-// and each one left the NEXT aired line repeating the form the listener had
-// just heard ("This is A." … "This is C."). Anchoring on air truth cannot
-// drift, and one shared sequence covers the whole air chain: the agent picker
-// and the stateless pool picker are two code paths for the same on-air slot,
-// and a listener hears one continuous sequence of links regardless of which
-// produced each one.
-
-// The composed frame is English, and only the model can write it in anything
-// else — languageDirective (settings/persona.ts) binds the persona to speak
-// exclusively in its own language, and code has no translation of "This is".
-// Same field read as languageDirective's: unset means English.
+// Alternate using the last aired line, not composed lines that may be dropped. Non-English
+// personas use the model.
 const ENGLISH_LANGUAGE = /^english$/i;
 
-// spokenProperNounDirective (settings/persona.ts) requires ZERO CJK characters
-// in any spoken field and tells the model to romanize (ウルフルズ → Ulfuls,
-// 周杰倫 → Jay Chou). A composed line interpolates the artist tag verbatim, so
-// a name in one of these scripts has to go through the model or an English
-// voice reads nothing at all. Hangul rides along for the same reason.
+// A composed line interpolates the artist tag verbatim, so a name in one of
+// these scripts has to go through the model (which romanizes) or an English
+// voice reads nothing at all.
 const NON_LATIN_NAME = new RegExp(
   '[\\u3000-\\u303f'   // CJK punctuation
   + '\\u3040-\\u30ff'  // hiragana + katakana
@@ -66,6 +40,21 @@ export interface AnnounceLineOptions {
 }
 
 /**
+ * Can the station frame these names in a line of composed English itself? Not
+ * for a persona that speaks something other than English, and not for a name
+ * in a script an English frame can't carry. announceLine's gate, shared with
+ * the request claim guard's plain copy (util/request-claim.ts, #1918) so the
+ * two composed-English lines can't disagree about when they may air.
+ */
+export function composedEnglishFits(persona: unknown, ...names: unknown[]): boolean {
+  const language = String(
+    (persona as { language?: unknown } | null | undefined)?.language ?? '',
+  ).trim();
+  if (language && !ENGLISH_LANGUAGE.test(language)) return false;
+  return names.every((name) => !NON_LATIN_NAME.test(String(name ?? '')));
+}
+
+/**
  * `This is <artist>.` or `Next up, <artist>.` — or `''` when the station
  * cannot compose the line itself and the model has to write it: no artist to
  * name, a persona that speaks something other than English, or an artist tag
@@ -78,11 +67,7 @@ export function announceLine(
   { lastLine = null, currentIsOnAir = false }: AnnounceLineOptions = {},
 ): string {
   const trimmed = String(artist ?? '').trim();
-  if (!trimmed || NON_LATIN_NAME.test(trimmed)) return '';
-  const language = String(
-    (persona as { language?: unknown } | null | undefined)?.language ?? '',
-  ).trim();
-  if (language && !ENGLISH_LANGUAGE.test(language)) return '';
+  if (!trimmed || !composedEnglishFits(persona, trimmed)) return '';
   const form = currentIsOnAir ? 'this-is' : nextAnnounceForm(lastLine);
   return form === 'this-is' ? `This is ${trimmed}.` : `Next up, ${trimmed}.`;
 }

@@ -1,9 +1,4 @@
 'use client';
-// Radio-card grid for picking the primary LLM provider. The status badge makes key
-// availability visible before a switch is saved — the #1 LLM misconfiguration is
-// routing to a cloud provider whose key isn't set. Tailwind-only, no inline styles
-// (issue #50). The fallback leg keeps the dropdown, since cards there would double
-// the tab's height for a secondary control.
 import { cn } from '../../../lib/cn';
 import { PROVIDER_META, providerStatus } from './providerMeta';
 
@@ -45,9 +40,6 @@ export function ProviderSelector({ value, providerIds, env, keyAware = true, onC
                 : 'border-ink bg-transparent hover:bg-[var(--ink-softer)]',
             )}
           >
-            {/* Title row — dot + name only, full card width. The status badge
-                moved to the bottom row so it never crowds long names
-                (OPENROUTER / ANTHROPIC / OpenAI-compatible). */}
             <div className="flex items-center gap-1.5">
               <span
                 className={cn(
@@ -64,7 +56,6 @@ export function ProviderSelector({ value, providerIds, env, keyAware = true, onC
                 {meta?.label || id}
               </span>
             </div>
-            {/* Bottom row — blurb on the left, status badge pinned bottom-right. */}
             <div className="flex items-end justify-between gap-2">
               <span className="min-w-0 text-[9px] leading-[1.4] text-muted">{meta?.blurb}</span>
               {status.label && (

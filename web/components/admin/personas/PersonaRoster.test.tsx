@@ -17,6 +17,7 @@ const persona: Persona = {
   localColour: 5,
   warmth: 5,
   soul: 'Calm and observant.',
+  musicLean: '',
   language: '',
   avatar: '',
   tts: {
@@ -52,6 +53,8 @@ test('the persona cap uses the unfiltered total, not the visible matches', () =>
     onSelect: () => {},
     communityCount: 0,
     onCommunity: () => {},
+    importing: false,
+    onImportBundle: () => {},
   }));
 
   const labelAt = html.indexOf('+ Add persona');

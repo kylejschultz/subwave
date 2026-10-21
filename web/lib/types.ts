@@ -147,14 +147,25 @@ export interface QueueEntry {
   album?: string;
   subsonic_id?: string;
   requestedBy?: string;
-  /** ISO timestamp present on history entries. */
+  /** ISO timestamp on older payloads; the live controller sends the three
+   *  below instead. All are live-edge. */
   t?: string;
+  /** When the track started airing; set once it reaches the air. */
+  startedAt?: string;
+  endedAt?: string;
+  /** When it joined the queue — earlier than it aired, often by minutes. */
+  queuedAt?: string;
   /** True once the controller has handed this item to Liquidsoap. */
   sent?: boolean;
   /** The track arrives via a pre-rendered stem blend rather than a plain
    *  crossfade. Stamped once the seam's clip is queued, so it's definitive,
    *  not a prediction (#1257). */
   stemSeam?: boolean;
+  /** The operator block this row was queued as part of (#1622 FR 4) — a whole
+   *  album, or a run of tracks for an artist show. Identity only: nothing on
+   *  the air path branches on it. `index`/`size` are stamped from the plan, so
+   *  a half-played block still reads "9 of 11". */
+  block?: { id: string; label: string; index: number; size: number };
   [key: string]: unknown;
 }
 
@@ -184,6 +195,7 @@ export interface RequestTrack {
 export interface RequestResult {
   success: boolean;
   pending?: boolean;
+  outcome?: 'matched' | 'substituted' | 'cooldown' | 'already-queued' | 'chat' | 'no-match' | 'unsupported' | 'error';
   ack?: string;
   track?: RequestTrack;
   queuePosition?: number;
@@ -193,17 +205,11 @@ export interface RequestResult {
   status?: RequestStatus;
 }
 
-export interface DjLogEntry {
-  t?: string;
-  text?: string;
-  [key: string]: unknown;
-}
-
-/** `/state` response. */
+/** `/state` response. The booth log (`djLog`) is operator diagnostics and is
+ *  not part of this public read; older controllers still send it. */
 export interface StationState {
   upcoming: QueueEntry[];
   history: QueueEntry[];
-  djLog: DjLogEntry[];
   timezone?: string;
   locale?: StationLocale;
   /** Operator player defaults. `skin` indexes components/skins;
@@ -220,6 +226,13 @@ export interface StationState {
  *  by `turnClass()`. */
 export type SessionRole = 'segment' | 'dj' | 'track' | 'system' | string;
 
+/** After a hard roll, GET /session briefly leads with the previous show's
+ *  tail (`meta.carried: true`, `meta.carriedFrom`, `meta.personaName`) and
+ *  one `role: 'event'`, `kind: 'show-boundary'` separator whose
+ *  `meta.boundary` is `{ at, show, persona, fromShow, fromSessionId }` (#1690).
+ *  See isCarriedTurn / isShowBoundary in lib/sessionFeed.
+ *  Spoken turns also carry `meta.airedAt` (the live-edge moment the words
+ *  began, #1382) and `meta.durationMs` (the clip's length, #1848). */
 export interface SessionTurn {
   t?: string | number;
   role?: SessionRole;

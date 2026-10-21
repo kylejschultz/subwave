@@ -1,7 +1,5 @@
 'use client';
 
-// DJ command center — /admin/dash. Speak custom text on air, fire voice segments,
-// flip the autonomous toggles, watch live status + the booth log.
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAdminAuth } from '../../lib/adminAuth';
@@ -48,6 +46,10 @@ import { cn } from '../../lib/cn';
 import { RequestsCard } from './dash/RequestsCard';
 import { TakeoverCard } from './dash/TakeoverCard';
 import QueueHeldBadge from './dash/QueueHeldBadge';
+import { blockPlayingTrack, neverPlayToast, notifyNeverPlay, refetchOnAirId, skipDecision, skipFailureOutcome, type SkipOutcome } from './dash/never-play';
+import { deleteBlockEntry, reconcileBlockCaches } from './library/block-actions';
+import type { BlockEntry } from './library/types';
+import { deadlineFallbacks, djLatencyMs, failedCallsNote } from './dash/latency-gauge';
 import { BoothTurnText, SegmentButton, SortableTh, ToggleRow, classTone } from './dash/bits';
 import type {
   ActResponse,
@@ -66,6 +68,10 @@ import {
   SEGMENTS,
   maskIp,
   sortConnections,
+  countryFlag,
+  countryTitle,
+  geoipHint,
+  trustedProxyHint,
 } from './dash/types';
 import {
   dashKeys,
@@ -74,14 +80,14 @@ import {
   fetchHealthStats,
   fetchRequests,
   fetchSuggestions,
+  removeQueuedRow,
   runDashAction,
 } from './dash/queries';
 
 // Listeners-table header cells. `sticky top-0` resolves against the ScrollArea
-// viewport, and the opaque card-bg stops rows showing through underneath. The
-// rule is an inset shadow, not `border-b`: under border-collapse (Tailwind
-// preflight) the border belongs to the table, so it stays behind while the cell
-// scrolls away.
+// viewport, and the opaque card-bg stops rows showing through. The rule is an
+// inset shadow, not `border-b`: under border-collapse the border belongs to the
+// table, so it would stay behind while the cell scrolls away.
 const STICKY_TH =
   'sticky top-0 z-[1] bg-[var(--card-bg)] shadow-[inset_0_-1px_0_var(--separator-strong)]';
 
@@ -96,10 +102,11 @@ export default function DashPanel() {
   // Drives the PromptInputSubmit glyph: ready → submitted → error flash → ready.
   const [sayStatus, setSayStatus] = useState<ChatStatus>('ready');
   const [confirmSkip, setConfirmSkip] = useState(false);
+  const [confirmNeverPlay, setConfirmNeverPlay] = useState(false);
 
   // Hardcoded set until the controller has a generated batch. The GET on mount
-  // never calls a model; the ↻ button's POST does.
-  // Longest-connected first by default — the most stable listeners on top.
+  // never calls a model; the refresh button's POST does.
+  // Longest-connected first by default.
   const [sort, setSort] = useState<SortState>({ key: 'connectedSeconds', dir: 'desc' });
   const [revealIps, setRevealIps] = useState(false);
 
@@ -121,7 +128,7 @@ export default function DashPanel() {
     refetchInterval: () => 15_000,
     request: fetchHealthStats,
   });
-  // A review surface, not a live ticker — keep the existing 10s cadence.
+  // A review surface, not a live ticker.
   const requestsQuery = useAdminQuery<RequestEntry[]>({
     key: dashKeys.requests(), adminFetch, enabled: ready, staleTime: 0,
     refetchInterval: () => 10_000,
@@ -135,6 +142,8 @@ export default function DashPanel() {
   const status = statusQuery.data ?? null;
   const err = statusQuery.error ? errorMessage(statusQuery.error) : null;
   const conns = connectionsQuery.data ?? null;
+  const proxyHint = trustedProxyHint(conns?.trustedProxies);
+  const countryHint = geoipHint(conns?.geoip, conns?.connections);
   const connErr = connectionsQuery.error ? errorMessage(connectionsQuery.error) : null;
   const stats = statsQuery.data ?? null;
   const requests = requestsQuery.data ?? null;
@@ -221,6 +230,81 @@ export default function DashPanel() {
   // Runs only after the confirm dialog — a skip cuts the track for every listener.
   const doSkip = () => act('skip', '/dj/skip', {}, 'skip track');
 
+  // The same block write and cache reconciliation the Library page uses
+  // (library/block-actions), so its Blocked tab and loaded lists show the
+  // entry whether or not they are mounted.
+  const blockMutation = useAdminMutation({
+    adminFetch,
+    toastOnError: false,
+    request: (trackId: string, fetcher) => blockPlayingTrack(fetcher, trackId),
+    // Not awaited: re-marking cached Library rows must not hold up the skip.
+    onDone: (_data, _vars, client) => { void reconcileBlockCaches(client, adminFetch); },
+  });
+  const unblockMutation = useAdminMutation<void, BlockEntry>({
+    adminFetch,
+    // The Undo toast reports a failure itself.
+    toastOnError: false,
+    request: (entry, fetcher) => deleteBlockEntry(fetcher, entry),
+    onDone: (_data, _vars, client) => reconcileBlockCaches(client, adminFetch),
+  });
+
+  // Runs only after the confirm dialog. The block lands FIRST: a failed block
+  // must not leave the operator with a skipped track that will still air
+  // again. The track is captured at open time, so a track change while the
+  // dialog is up blocks what the operator was looking at, not its successor.
+  const [neverPlayTarget, setNeverPlayTarget] = useState<{ id: string; title: string; artist?: string } | null>(null);
+  const openNeverPlay = () => {
+    const cur = status?.nowPlaying;
+    if (!cur?.subsonic_id || !cur.title) return;
+    setNeverPlayTarget({ id: cur.subsonic_id, title: cur.title, artist: cur.artist });
+    setConfirmNeverPlay(true);
+  };
+  const doNeverPlay = async (skipToo: boolean) => {
+    const target = neverPlayTarget;
+    if (!target) return;
+    setBusy('never-play');
+    try {
+      const r = await blockMutation.mutateAsync(target.id);
+      let skip: SkipOutcome = 'not-asked';
+      let skipError: string | undefined;
+      if (skipToo) {
+        // Decide on a read that landed AFTER the block, never on `status`
+        // from this render: the track can change while the block request is
+        // in flight, and the closure would still show the blocked one
+        // (skipping its successor for every listener). A failed or offline
+        // refetch is no read, and nothing is skipped without one. The read
+        // names a song, never what airs: a bed or pause-talk break leaves
+        // now-playing on the song before it, a jingle's seam moves it on to
+        // the song after it while the outgoing tail and the jingle still
+        // play, and the song can end during the skip's commit wait. So the
+        // skip names its target and the controller refuses (409) unless the
+        // blocked track is what is on air: moot, or behind a jingle, which
+        // tells the operator to skip again in a few seconds.
+        const onAirId = await refetchOnAirId(queryClient);
+        const decision = skipDecision({ targetId: target.id, onAirId });
+        if (decision === 'skip') {
+          setBusy('skip');
+          try {
+            await actionMutation.mutateAsync({ path: '/dj/skip', body: { expectId: target.id } });
+            skip = 'done';
+          } catch (e) {
+            skip = skipFailureOutcome(e);
+            if (skip === 'failed') skipError = errorMessage(e);
+          }
+        } else {
+          skip = decision;
+        }
+      }
+      const t = neverPlayToast({ title: target.title, artist: target.artist, block: r.block, skip, purged: r.purged, skipError });
+      notifyNeverPlay(t, r.entry, e => unblockMutation.mutateAsync(e));
+    } catch (e) {
+      notify.err(`never play: ${errorMessage(e)}`);
+    } finally {
+      setBusy(null);
+      void queryClient.invalidateQueries({ queryKey: dashKeys.status() });
+    }
+  };
+
   // No confirm: nothing on-air changes, worst case a 409 because the track went
   // on air first. The row drops optimistically; the poll confirms.
   const cancelQueueItem = useAdminMutation<ActResponse, string>({
@@ -240,29 +324,60 @@ export default function DashPanel() {
     },
   });
 
+  // Cancel the rest of an operator block (#1622 FR 4) — the inverse of the one
+  // press that queued it. Partial success is the NORMAL answer rather than an
+  // error: a track the mixer has already taken plays out and comes back in
+  // `kept`, so the toast reports both instead of calling the cancel a failure.
+  //
+  // No optimistic patch, unlike the per-track cancel above: which members
+  // survive is the SERVER's answer, and guessing it would blank rows that are
+  // still going to air. The invalidate below is the only truth.
+  const cancelQueueBlock = useAdminMutation<
+    { removed?: number; kept?: number; label?: string | null; error?: string }, string
+  >({
+    adminFetch,
+    toastOnError: false,
+    request: async (blockId, fetcher) => {
+      const response = await fetcher(`/dj/queue/block/${encodeURIComponent(blockId)}`, { method: 'DELETE' });
+      const body = await response.json().catch(() => ({})) as { removed?: number; kept?: number; label?: string | null; error?: string };
+      if (!response.ok) throw new Error(body.error || `failed (${response.status})`);
+      return body;
+    },
+    onDone: async (_data, _id, client) => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: dashKeys.status() }),
+        client.invalidateQueries({ queryKey: dashKeys.requests() }),
+      ]);
+    },
+  });
+
+  const cancelBlock = async (block: { id: string; label: string }) => {
+    setBusy(`block:${block.id}`);
+    try {
+      const out = await cancelQueueBlock.mutateAsync(block.id);
+      const removed = out.removed ?? 0;
+      notify.ok(
+        `cancelled ${removed} track${removed === 1 ? '' : 's'} from ${out.label || block.label}`
+        + (out.kept ? ` · ${out.kept} already committed and will play out` : ''),
+      );
+    } catch (e) {
+      notify.err(`cancel block: ${errorMessage(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const cancelQueued = async (t: QueueEntry) => {
     const id = typeof t.subsonic_id === 'string' ? t.subsonic_id : '';
     if (!id) return;
     setBusy(`cancel:${id}`);
-    await queryClient.cancelQueries(
-      { queryKey: dashKeys.status(), exact: true },
-      { silent: true },
-    );
-    queryClient.setQueryData<DashStatus>(dashKeys.status(), current => current
-      ? {
-          ...current,
-          queue: {
-            ...(current.queue || {}),
-            upcoming: (current.queue?.upcoming || []).filter(item => item.subsonic_id !== id),
-          },
-        }
-      : current);
+    await removeQueuedRow(queryClient, id);
     try {
       await cancelQueueItem.mutateAsync(id);
       notify.ok(`removed from queue: ${t.title || 'track'}`);
     } catch (e) {
-      // A 409 usually means the row crossed the live boundary. Never restore
-      // the old full envelope over a newer poll; ask both owners for truth.
+      // A 409 usually means the row crossed the live boundary. Never restore the
+      // old full envelope over a newer poll; ask both owners for truth.
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: dashKeys.status() }),
         queryClient.invalidateQueries({ queryKey: dashKeys.requests() }),
@@ -276,7 +391,7 @@ export default function DashPanel() {
   const np = status?.nowPlaying;
   const ctx = status?.context;
   // On-air timestamps render in the station zone so they match what the DJ
-  // speaks, not the operator's browser timezone (issue #418).
+  // speaks, not the operator's browser timezone (#418).
   const tz = status?.timezone;
   const locale = status?.locale;
   const q: QueueState = status?.queue || {};
@@ -286,19 +401,18 @@ export default function DashPanel() {
   const history = q.history || [];
   // The controller publishes a label only after the incoming item has drained
   // and its transition flags are final. Never reconstruct it from raw queue
-  // flags here: an unsent proposal can still be vetoed or replaced.
+  // flags: an unsent proposal can still be vetoed or replaced.
   const nextTransition = q.nextTransition ?? '—';
   // Under pair-aware drain the first upcoming item is held unsent for most of
-  // each track, so the em dash is the NORMAL reading rather than a fault — say
-  // so, or it reads as a broken panel. The armed tooltip names the pair the
-  // label describes: this is the seam out of the on-air track, not out of the
-  // queue row it sits above.
+  // each track, so the em dash is the NORMAL reading rather than a fault. The
+  // armed tooltip names the pair the label describes: the seam out of the on-air
+  // track, not out of the queue row it sits above.
   const nextTransitionHint = q.nextTransition
     ? 'How the on-air track hands over to the first queued track'
     : 'Not armed yet — the seam is decided when the next track is handed to the mixer';
   // `sessionMessages` arrives in air order and is shown newest first. Each turn
-  // carries its ORIGINAL index: turnKey() folds the index into the React key, and
-  // a display index would shift under every new turn, remounting the whole list.
+  // carries its ORIGINAL index: a display index would shift under every new turn
+  // and remount the whole list.
   const booth = status?.sessionMessages || [];
   const boothNewestFirst = booth.map((turn, i) => ({ turn, i })).reverse();
 
@@ -307,18 +421,22 @@ export default function DashPanel() {
     ? `${ctx.weather.condition}${ctx.weather.temp != null ? ` ${Math.round(ctx.weather.temp)}°` : ''}`
     : '—';
 
-  // A meter with no data yet (stats not loaded, or zero calls since boot) is
-  // passed null so the strip shows "—" rather than a misleading zero.
+  // A meter with no data yet is passed null so the strip shows a dash rather
+  // than a misleading zero.
   const lCurrent =
     listenersObj?.current ?? (typeof listenersValue === 'number' ? listenersValue : 0);
   const lPeak = listenersObj?.peak ?? lCurrent;
+  const shortlistSelected = stats?.trackSelection === 'shortlist';
   const healthMetrics: HealthMetrics = {
     listeners: lCurrent,
     listenersPeak: lPeak,
-    latencyMs: stats?.llm?.count ? (stats.llm.latency?.p95 ?? null) : null,
-    // Redline at the DJ-agent deadline so the gauge tracks the model in use, not
-    // a fixed ceiling. Null until /stats loads → StationHeader's default scale.
-    latencyDeadlineMs: stats?.llm?.agentTimeoutMs ?? null,
+    latencyMs: djLatencyMs(stats),
+    latencyFallbacks: deadlineFallbacks(stats),
+    llmFailedCalls: failedCallsNote(stats),
+    // Redline at the DJ-agent deadline so the gauge tracks the model in use.
+    // Null until /stats loads.
+    latencyDeadlineMs: shortlistSelected ? (stats?.shortlist?.warningMs ?? 30_000) : (stats?.llm?.agentTimeoutMs ?? null),
+    latencyAdaptive: shortlistSelected,
     ttsFallbackPct: stats?.tts?.count ? Math.round((stats.tts.fallbackRate ?? 0) * 1000) / 10 : null,
     online: status?.streamOnline ?? null,
     bitrateKbps: status?.streamBitrate ?? null,
@@ -334,6 +452,8 @@ export default function DashPanel() {
       <StationHeader
         metrics={healthMetrics}
         np={np}
+        onNeverPlay={openNeverPlay}
+        canNeverPlay={!!np?.subsonic_id}
         djName={djName}
         showName={showName}
         weatherText={weatherText}
@@ -385,10 +505,7 @@ export default function DashPanel() {
                         <QueueItemContent className="text-[12px] text-ink">
                           {t.title} <span className="text-muted">— {t.artist}</span>
                         </QueueItemContent>
-                        {/* `stemSeam` rides the successor, so keep its definitive
-                            marker on that row even while the header describes
-                            the earlier current → first-upcoming transition. Text
-                            makes the meaning explicit without the old opaque icon. */}
+                        {/* stemSeam belongs to the successor track. */}
                         {t.stemSeam ? (
                           <span
                             title="Arrives via a rendered blend mixed from cached stems"
@@ -397,13 +514,31 @@ export default function DashPanel() {
                             Stem blend
                           </span>
                         ) : null}
+                        {t.block && upcoming.findIndex(u => u.block?.id === t.block!.id) === i ? (
+                          <span className="flex shrink-0 items-center gap-1.5">
+                            <span
+                              title={`Queued as one block: ${t.block.label}`}
+                              className="text-[8px] font-bold tracking-[0.14em] whitespace-nowrap text-ink/70 uppercase"
+                            >
+                              {t.block.label} · {t.block.index}/{t.block.size}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => cancelBlock({ id: t.block!.id, label: t.block!.label })}
+                              disabled={busy === `block:${t.block.id}`}
+                              title="Cancel the rest of this block"
+                              className="text-[8px] font-bold tracking-[0.14em] whitespace-nowrap text-muted uppercase hover:text-vermilion disabled:opacity-50"
+                            >
+                              cancel the rest
+                            </button>
+                          </span>
+                        ) : null}
                         <QueueHeldBadge sent={t.sent} />
                         <span className="mono-num text-[10px] whitespace-nowrap text-muted">
                           {typeof t.duration === 'number' || typeof t.duration === 'string'
                             ? t.duration
                             : ''}
                         </span>
-                        {/* Per-track cancel (#1006). */}
                         {typeof t.subsonic_id === 'string' && t.subsonic_id ? (
                           <QueueItemActions className="opacity-100">
                             <QueueItemAction
@@ -472,11 +607,6 @@ export default function DashPanel() {
               <div className="text-muted italic">no session turns yet</div>
             ) : (
               <div className="relative min-h-[220px] flex-1">
-                {/* The absolute-inset wrapper keeps the log out of the card's
-                    intrinsic height, so the card tracks the right column instead
-                    of growing to fit every turn. The scroller stays anchored at
-                    the TOP: newest first means turns prepend, so scrollTop 0
-                    keeps showing the newest turn on its own. */}
                 <div className="absolute inset-0">
                   <div
                     className="h-full overflow-y-auto"
@@ -520,8 +650,6 @@ export default function DashPanel() {
 
         <div className="grid gap-4">
           <Card title="Manual voice DJ" sub="speak now">
-            {/* Chips fill the textarea, never send, and flip the box to Styled —
-                they are directions for the DJ, and raw would air the instruction. */}
             <div className="mb-2.5 flex items-center gap-1.5">
               <div className="min-w-0 flex-1">
                 <Suggestions className="gap-1.5">
@@ -533,8 +661,7 @@ export default function DashPanel() {
                         setSayText(text);
                         setSayMode('styled');
                       }}
-                      // min-h-9 is a thumb-sized target on a phone; sm: drops
-                      // back to the dense desktop pill.
+                      // min-h-9 is a thumb-sized target on a phone.
                       className="h-auto min-h-9 rounded-none border-separator-strong px-3 py-[3px] text-[9px] font-medium tracking-[0.04em] text-muted normal-case hover:bg-[var(--overlay)] hover:text-ink sm:min-h-0 sm:px-2"
                     />
                   ))}
@@ -565,18 +692,15 @@ export default function DashPanel() {
                   }
                 />
               </PromptInputBody>
-              {/* Two rows (controls, then a full-width send bar): on the ~550px
-                  column a single flex-wrap row broke unpredictably, leaving the
-                  button dangling under empty space. */}
               <PromptInputFooter className="flex-col items-stretch gap-2.5">
-                <PromptInputTools className="flex-wrap items-center gap-x-5 gap-y-2">
-                  <div className="flex items-center gap-1.5">
+                <PromptInputTools className="grid w-full grid-cols-2 items-end gap-3 [&_[role=group]]:w-full [&_[role=group]]:flex-nowrap [&_button]:flex-1 [&_button]:px-2 [&_button]:tracking-normal">
+                  <div className="grid min-w-0 gap-1.5">
                     <span className="caption">mode</span>
-                    <Seg value={sayMode} options={SAY_MODES} onChange={setSayMode} />
+                    <Seg aria-label="Voice mode" value={sayMode} options={SAY_MODES} onChange={setSayMode} />
                   </div>
-                  <div className="flex items-center gap-1.5">
+                  <div className="grid min-w-0 gap-1.5">
                     <span className="caption">duck</span>
-                    <Seg value={sayKind} options={SAY_KINDS} onChange={setSayKind} />
+                    <Seg aria-label="Voice ducking" value={sayKind} options={SAY_KINDS} onChange={setSayKind} />
                   </div>
                 </PromptInputTools>
                 <PromptInputSubmit
@@ -586,8 +710,6 @@ export default function DashPanel() {
                   disabled={!!busy || !sayText.trim()}
                   className="w-full rounded-none px-3"
                 >
-                  {/* No children while in flight / erroring, so the status glyphs
-                      take over from the label. */}
                   {sayStatus === 'ready' ? 'Send to air →' : undefined}
                 </PromptInputSubmit>
               </PromptInputFooter>
@@ -595,8 +717,6 @@ export default function DashPanel() {
           </Card>
 
           <Card title="DJ segments" sub="fire on demand">
-            {/* 2-up on a phone so each pad keeps a full-width label, and a 4th
-                "banter" pad squares off rather than dangling. */}
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {[...SEGMENTS, ...((status?.activeShow?.guests?.length ?? 0) > 0 ? [BANTER_SEGMENT] : [])].map(s => {
                 const k = `seg:${s.type}`;
@@ -659,16 +779,30 @@ export default function DashPanel() {
           connErr ? (
             <Pill>unavailable</Pill>
           ) : conns && conns.connections.length > 0 ? (
-            <button
-              type="button"
-              className="inline-flex min-h-9 items-center text-[9px] font-bold tracking-[0.2em] text-muted uppercase hover:text-ink sm:min-h-0"
-              onClick={() => setRevealIps(v => !v)}
-            >
-              {revealIps ? 'hide IPs' : 'show IPs'}
-            </button>
+            <Btn sm onClick={() => setRevealIps(v => !v)}>
+              {revealIps ? 'Hide IPs' : 'Show IPs'}
+            </Btn>
           ) : null
         }
       >
+        {!connErr && conns && proxyHint ? (
+          <div className="mb-2 border-l-2 border-separator-strong pl-2 text-[11px] text-muted">
+            {proxyHint}{' '}
+            <a
+              className="underline hover:text-ink"
+              href="https://github.com/perminder-klair/subwave/blob/main/docs/reverse-proxy.md"
+              target="_blank"
+              rel="noreferrer"
+            >
+              reverse-proxy guide
+            </a>
+          </div>
+        ) : null}
+        {!connErr && conns && countryHint ? (
+          <div className="mb-2 border-l-2 border-separator-strong pl-2 text-[11px] text-muted">
+            {countryHint}
+          </div>
+        ) : null}
         {connErr ? (
           <div className="text-muted italic">can’t reach Icecast admin: {connErr}</div>
         ) : !conns ? (
@@ -676,8 +810,8 @@ export default function DashPanel() {
         ) : conns.connections.length === 0 ? (
           <div className="text-muted italic">nobody listening right now</div>
         ) : (
-          /* Capped like the other admin lists so a busy station's connection list
-             scrolls inside the card instead of stretching the dash down the page. */
+          /* Capped like the other admin lists so a busy station's connection
+             list scrolls inside the card. */
           <ScrollArea className="max-h-[360px]">
             <table className="w-full text-[12px]">
               <thead>
@@ -689,8 +823,13 @@ export default function DashPanel() {
                     onSort={setSort}
                     className={STICKY_TH + ' pr-3'}
                   />
-                  {/* Mount is dropped on a phone; the other three fit 390px
-                      without a sideways scroll. */}
+                  <SortableTh
+                    label="Country"
+                    col="country"
+                    sort={sort}
+                    onSort={setSort}
+                    className={STICKY_TH + ' pr-3'}
+                  />
                   <SortableTh
                     label="Mount"
                     col="mount"
@@ -718,12 +857,21 @@ export default function DashPanel() {
                 {sortConnections(conns.connections, sort).map((c, i) => (
                   <tr
                     key={`${c.ip}:${c.mount}:${i}`}
-                    // The sticky header already draws a solid rule, so the top
-                    // row's dashed border would double it.
+                    // The sticky header already draws a solid rule.
                     className="border-t border-dashed border-separator-strong first:border-t-0"
                   >
                     <td className="py-1.5 pr-3 font-mono whitespace-nowrap" title={c.ip}>
                       {revealIps ? c.ip || '—' : maskIp(c.ip)}
+                    </td>
+                    <td className="py-1.5 pr-3 whitespace-nowrap" title={countryTitle(c)}>
+                      {c.country ? (
+                        <>
+                          <span aria-hidden="true">{countryFlag(c.country)}</span>{' '}
+                          <span className="font-mono">{c.country}</span>
+                        </>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
                     </td>
                     <td className="hidden py-1.5 pr-3 whitespace-nowrap text-muted sm:table-cell">
                       {c.mount}
@@ -763,6 +911,24 @@ export default function DashPanel() {
         confirmLabel="skip track"
         danger
         onConfirm={doSkip}
+      />
+
+      {/* The target outlives the close on purpose: the close animation still
+          shows its text, and clearing it blanked the dialog as it faded.
+          openNeverPlay overwrites it before every open, and the two actions,
+          its only readers, exist only while the dialog is open. */}
+      <V3AlertDialog
+        open={confirmNeverPlay}
+        onOpenChange={setConfirmNeverPlay}
+        title="Never play this track"
+        description={neverPlayTarget
+          ? `Add “${neverPlayTarget.title}”${neverPlayTarget.artist ? ` — ${neverPlayTarget.artist}` : ''} to the never-play list? It will never air again, listener requests included. You can lift it from Library → Blocked.`
+          : ''}
+        altLabel="block, let it finish"
+        onAlt={() => void doNeverPlay(false)}
+        confirmLabel="block + skip now"
+        danger
+        onConfirm={() => void doNeverPlay(true)}
       />
     </div>
   );

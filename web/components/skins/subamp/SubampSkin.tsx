@@ -1,10 +1,10 @@
 'use client';
 
-// The tune-in gate is inline, not an overlay: the deck loads un-tuned and the
-// ▶ click is the browser's audio-unblock gesture.
+// The inline play button provides the browser audio-unblock gesture.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { AnimatePresence, m, useReducedMotion } from 'motion/react';
+import { ArrowUpRight, ChevronDown, ChevronUp, Heart, Play, Square, X } from 'lucide-react';
 import styles from './Subamp.module.css';
 import Analyzer from './Analyzer';
 import {
@@ -40,10 +40,8 @@ import {
 import { useRequestSlip, useSkinMotion, useTrackLike, useVolumeNudge } from '../sharedHooks';
 import type { SkinProps } from '../types';
 
-/* Opacity only, no transform, no exit. Because it IS opacity-only,
-   MotionConfig's reducedMotion="user" won't touch it (that setting drops
-   transforms and deliberately preserves opacity), so this is the one skin that
-   has to check useReducedMotion() for itself. */
+/* Opacity only, so MotionConfig's reducedMotion="user" won't touch it (it drops
+   transforms and preserves opacity); this skin checks useReducedMotion itself. */
 const LATCH = { opacity: [1, 0.25, 1, 0.4, 1] };
 const LATCH_TRANSITION = { duration: 0.18, times: [0, 0.2, 0.45, 0.7, 1] };
 const STEADY = { opacity: 1 };
@@ -53,13 +51,12 @@ const ART_FLASH = {
   exit: { opacity: 0 },
   transition: { duration: 0.09 },
 };
-/* Lite: mount straight at rest — a zero-duration transition still paints
-   `initial` for a frame, flashing an empty art panel on every change. */
+/* Lite: mount at rest; a zero-duration transition still paints `initial` for a
+   frame, flashing an empty art panel on every change. */
 const ART_CUT = {
   initial: false,
   animate: { opacity: 1 },
-  // Nothing on the way out either — a fade-to-zero on the outgoing
-  // node is still an animation, however brief.
+  // Nothing on the way out either: a fade-to-zero is still an animation.
   exit: {},
   transition: { duration: 0 },
 };
@@ -88,11 +85,13 @@ function Window({ title, children, className }: { title: ReactNode; children: Re
           type="button"
           onClick={() => setOpen(o => !o)}
           aria-label={open ? 'Roll window up' : 'Roll window down'}
-          className="v3-focus cursor-pointer border border-[var(--line)] bg-transparent px-1 text-[9px] leading-tight text-muted hover:text-ink"
+          className="v3-focus cursor-pointer border border-[var(--line)] bg-transparent px-0.5 py-px text-muted hover:text-ink"
         >
-          {open ? '▁' : '▆'}
+          {open ? <ChevronUp className="size-2.5" strokeWidth={3} /> : <ChevronDown className="size-2.5" strokeWidth={3} />}
         </button>
-        <span className="border border-[var(--line)] px-1 text-[9px] leading-tight text-muted opacity-60" aria-hidden="true">✕</span>
+        <span className="border border-[var(--line)] px-0.5 py-px text-muted opacity-60" aria-hidden="true">
+          <X className="size-2.5" strokeWidth={3} />
+        </span>
       </div>
       {open && children}
     </div>
@@ -150,7 +149,7 @@ export default function SubampSkin(_props: SkinProps) {
   const marqueeText = offline
     ? `OFF AIR ▪ ${stationName} ▪ THE STREAM WILL BE BACK ▪▸ `
     : showTuneIn
-      ? `PRESS ▶ TO TUNE IN ▪ ${stationName} ▪ ONE LIVE STREAM ▪▸ `
+      ? `PRESS PLAY TO TUNE IN ▪ ${stationName} ▪ ONE LIVE STREAM ▪▸ `
       : [
           [nowPlaying?.title, nowPlaying?.artist].filter(Boolean).join(' — '),
           [nowPlaying?.album, nowPlaying?.year].filter(Boolean).join(' · '),
@@ -160,14 +159,13 @@ export default function SubampSkin(_props: SkinProps) {
 
   const digits = showTuneIn || offline ? '--:--' : fmtTime(elapsed);
 
-  // The latch fires when the keyed plate remounts, which would include the
-  // skin's own first paint — suppress that one so tuning in doesn't blink.
+  // The latch fires on every keyed-plate remount, including first paint;
+  // suppress that one so tuning in doesn't blink.
   const painted = useRef(false);
   useEffect(() => { painted.current = true; }, []);
-  // Lite mode's CSS kill can't reach motion; reduced motion can't reach an
-  // opacity-only animation. Both have to be asked here (see LATCH above), and
-  // both unconditionally — short-circuiting these into one && would make the
-  // second a conditional hook call.
+  // Lite mode's CSS kill can't reach motion and reduced motion can't reach an
+  // opacity-only animation, so both are asked here, unconditionally: combining
+  // them with && would make the second a conditional hook call.
   const mayAnimate = useSkinMotion();
   const reduced = useReducedMotion();
   const latching = mayAnimate && !reduced;
@@ -226,8 +224,7 @@ export default function SubampSkin(_props: SkinProps) {
               </div>
             </div>
 
-            {/* Keyed on the copy so the plate remounts and re-latches; the
-                inner key is what restarts the CSS scroll from the left. */}
+            {/* Remount on text changes to restart the CSS scroll. */}
             <m.div
               key={marqueeText}
               animate={latch}
@@ -268,7 +265,7 @@ export default function SubampSkin(_props: SkinProps) {
                     : 'border-[var(--accent)] bg-[var(--accent)] text-bg',
                 )}
               >
-                ▶
+                <Play className="size-3.5 fill-current" strokeWidth={0} />
               </button>
               <button
                 type="button"
@@ -279,7 +276,7 @@ export default function SubampSkin(_props: SkinProps) {
                   tunedIn ? 'cursor-pointer text-ink hover:bg-[var(--overlay)]' : 'cursor-default text-muted',
                 )}
               >
-                ■
+                <Square className="size-3 fill-current" strokeWidth={0} />
               </button>
               <button
                 type="button"
@@ -307,7 +304,7 @@ export default function SubampSkin(_props: SkinProps) {
                     like.pending && 'opacity-60',
                   )}
                 >
-                  {like.liked ? '♥' : '♡'}
+                  <Heart className={cn('size-3.5', like.liked && 'fill-current')} />
                 </button>
               )}
               <button
@@ -317,8 +314,7 @@ export default function SubampSkin(_props: SkinProps) {
               >
                 REQ
               </button>
-              {/* VOL is last so it (not REQ) is the flex item that reflows to a
-                  full-width second line when the deck is too narrow for one row */}
+              {/* Keep VOL last so it takes the second row on narrow decks. */}
               <div className="ml-2 flex min-w-[120px] flex-1 items-center gap-2">
                 <span className="text-[9px] font-bold tracking-[0.16em] text-muted">VOL</span>
                 <input
@@ -337,19 +333,24 @@ export default function SubampSkin(_props: SkinProps) {
         </Window>
 
         <Window title={<>BOOTH FEED ▪ {djName.toUpperCase()}</>} className="flex min-h-0 flex-1 flex-col lg:block lg:flex-none">
-          {/* Needs a definite height for the scroll region, hence lg:h-[240px]
-              rather than a content-driven max-height. */}
+          {/* A definite height lets the scroll region resolve. */}
           <Conversation className={cn('min-h-0 flex-1 lg:h-[240px]', styles.screen)}>
             <ConversationContent className="flex flex-col gap-2 px-4 py-3">
               {booth.length === 0 && (
                 <div className="text-[11px] text-muted">waiting for the booth…</div>
               )}
-              {booth.map((line, i) => (
-                <div key={`${line.t ?? i}-${i}`} className="text-[12px] leading-relaxed break-words">
+              {/* After a show boundary the previous show's tail is dimmed and
+                  voiced under its own host, below a rule (#1690). */}
+              {booth.map((line, i) => line.boundary ? (
+                <div key={`${line.t ?? i}-${i}`} role="separator" className="truncate text-[11px] text-muted">
+                  ──── {line.text} ────
+                </div>
+              ) : (
+                <div key={`${line.t ?? i}-${i}`} className={cn('text-[12px] leading-relaxed break-words', line.carried && 'opacity-60')}>
                   {line.kind === 'voice' ? (
                     <>
                       <span className="text-muted">{turnClock(line.t, timezone, stationLocale)}</span>{' '}
-                      <span className="font-bold text-[var(--accent)]">{djName.toUpperCase()} ●</span>{' '}
+                      <span className="font-bold text-[var(--accent)]">{(line.speaker ?? djName).toUpperCase()} ●</span>{' '}
                       “{line.text}”
                     </>
                   ) : (
@@ -368,7 +369,6 @@ export default function SubampSkin(_props: SkinProps) {
           title={<>STATION LOG{listenerCount != null ? ` ▪ ${listenerCount} LISTENING` : ''}</>}
           className="flex min-h-0 flex-1 flex-col lg:block lg:flex-none"
         >
-          {/* Definite height so the scroll region resolves, as above. */}
           <Conversation className={cn('min-h-0 flex-1 lg:h-[200px]', styles.screen)}>
             <ConversationContent className="flex flex-col gap-1.5 py-2.5 pr-5 pl-4">
               {history.map((h, i) => (
@@ -383,7 +383,7 @@ export default function SubampSkin(_props: SkinProps) {
               <div className="-ml-4 flex gap-2.5 bg-[var(--field)] py-0.5 pl-4 text-[11px] font-bold tracking-[0.06em] text-[var(--accent)] uppercase">
                 <span>{history.length + 1}.</span>
                 <span className="min-w-0 flex-1 truncate">
-                  ▶ {offline ? '— off air —' : (nowPlaying?.title ?? 'scanning…')}
+                  <Play className="inline size-2.5 fill-current" strokeWidth={0} /> {offline ? '— off air —' : (nowPlaying?.title ?? 'scanning…')}
                   {!offline && nowPlaying?.artist ? ` — ${nowPlaying.artist}` : ''}
                 </span>
                 <span>{fmtTime(elapsed)}</span>
@@ -406,8 +406,6 @@ export default function SubampSkin(_props: SkinProps) {
             onSubmit={e => { e.preventDefault(); void slip.send(); }}
           >
               <div className="flex items-baseline gap-2.5">
-                {/* Fixed width on both label cells so the ask and the signature
-                    inputs share a left edge — the labels differ in length. */}
                 <span className="w-[68px] flex-none text-[10px] tracking-[0.14em] text-muted select-none">DEAR DJ —</span>
                 {slip.ack ? (
                   <>
@@ -439,13 +437,11 @@ export default function SubampSkin(_props: SkinProps) {
                           : 'cursor-pointer text-[var(--accent)] hover:opacity-80',
                       )}
                     >
-                      {slip.sending ? '…' : 'SEND ↗'}
+                      {slip.sending ? '…' : <span className="flex items-center gap-1">SEND <ArrowUpRight className="size-3" /></span>}
                     </button>
                   </>
                 )}
               </div>
-              {/* Sign the slip and the DJ says your name on air (#1347).
-                  Hidden once the ack lands — there is nothing left to sign. */}
               {!slip.ack && (
                 <div className="flex items-baseline gap-2.5">
                   <span className="w-[68px] flex-none text-[10px] tracking-[0.14em] text-muted select-none">FROM —</span>

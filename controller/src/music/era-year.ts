@@ -1,15 +1,5 @@
-// The one definition of the year a track's ERA is judged by (issue
-// #842/#1418). Kept below show-filter so storage writes can detect when an
-// era-bearing text vector becomes stale without importing the library-facing
-// filter module back into library-db.
-
-// Precedence: the resolved original release year (walk-time album tag,
-// MusicBrainz enrichment, or manual override) wins; a plain `year` counts only
-// when it describes the recording rather than a compilation/reissue release.
-//
-// Junk-year guard shared by both fields: Number(null)/Number('') are 0, and
-// some taggers write TYER=0000. A real recording year is always > 0, so null,
-// blank, non-finite and non-positive values all read as unknown.
+// Resolve era from original-release metadata or a manual override. Use year only when it
+// describes the recording; blank, nonfinite, or nonpositive years are unknown. #842, #1418.
 export function resolveEraYear(
   year: number | string | null | undefined,
   originalYear: number | null | undefined,

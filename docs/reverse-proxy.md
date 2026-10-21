@@ -25,7 +25,7 @@ Every split-service proxy must apply these rules in this order:
 
 | Public path | Upstream | Path sent upstream | Required handling |
 |---|---|---|---|
-| `/api/listener-auth` | none | none | Return 404 or otherwise deny it before the general API rule. Icecast calls this password callback over the private Compose network; it must not be public. |
+| `/api/listener-auth` and anything starting with it | none | none | Return 404 or otherwise deny it before the general API rule. Match it as a case-insensitive prefix: the controller also answers `/listener-auth/` and any case variant, so an exact-path rule leaves those routed. Icecast calls this password callback over the private Compose network; it must not be public. |
 | `/stream*` | Icecast on `:7702` | unchanged | Disable response buffering, caching, and compression. Match the prefix so optional Opus, FLAC, and AAC mounts work without another proxy edit. |
 | `/listen.pls`, `/listen.m3u` | Controller on `:7701` | unchanged | These tune-in files are controller routes, not Icecast routes. |
 | `/api/*` | Controller on `:7701` | strip `/api` | `/api/health` must reach the controller as `/health`. Keep streaming responses such as diagnosis events unbuffered. |
@@ -34,6 +34,17 @@ Every split-service proxy must apply these rules in this order:
 The examples use the default ports and a proxy on the same host. Replace
 `127.0.0.1` with an address or Docker service name reachable from your proxy
 when it runs elsewhere.
+
+### Optional: a listener-country header
+
+Admin → Stats rolls listener sessions up by country, and the value it reads
+first is `CF-IPCountry` — which only Cloudflare sets. If your proxy can add a
+country header of its own (nginx with the GeoIP2 module, Traefik behind a CDN),
+forward it and name it in Admin → Settings → Broadcast & mixer → **Listener country**.
+Where it can't, point the same card at an offline `.mmdb` database instead.
+Neither is required: with no country, sessions are still counted, just without
+geography. Full recipe, including where to get a database:
+[deployment.md → Listener country on the Stats page](deployment.md#listener-country-on-the-stats-page).
 
 ## nginx
 
@@ -51,7 +62,9 @@ proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header X-Forwarded-Proto $scheme;
 
 # Icecast's private URL-auth callback. This must win over location /api/.
-location = /api/listener-auth {
+# A case-insensitive regex prefix, not `location =`: the controller also
+# answers a trailing slash and any case, which an exact match lets through.
+location ~* ^/api/listener-auth {
     return 404;
 }
 
@@ -90,6 +103,24 @@ real-IP module with only that edge's addresses first. `$remote_addr` will then
 hold the resolved client address and the rule above will still replace any
 client-supplied forwarding chain.
 
+**Name this proxy in SUB/WAVE's `.env` too.** Sending the header is only half
+the job: Icecast ignores `X-Forwarded-For` unless the peer that sent it is on
+its own trusted list, and on `docker-compose.byo.yml` there is no bundled Caddy
+for it to find by name. Without this, Admin → Listeners shows the same private
+address on every row.
+
+```bash
+# .env — the address nginx reaches Icecast from. On a host-network nginx
+# talking to the container, that is usually the Docker bridge gateway.
+ICECAST_TRUSTED_PROXY_IPS=172.17.0.1
+```
+
+Icecast matches an **exact IP**, so a subnet like `172.17.0.0/16` is accepted
+and then never matches anything; list the addresses. If you are unsure what
+Icecast is seeing, the current (wrong) IP in the Listeners table *is* the
+address to trust. Restart the broadcast container to apply it — Admin →
+Listeners says so itself when nothing was trusted.
+
 Reload only after nginx accepts the configuration:
 
 ```bash
@@ -118,7 +149,7 @@ proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header X-Forwarded-Proto $scheme;
 
-location = /api/listener-auth {
+location ~* ^/api/listener-auth {
     return 404;
 }
 
@@ -148,6 +179,9 @@ location /api/ {
 NPM's generated `/` location continues to send the web UI to the Proxy Host's
 port `7700`. The Advanced locations override only the API, tune-in files, and
 stream mounts.
+
+Set `ICECAST_TRUSTED_PROXY_IPS` for real listener IPs here too — the NPM
+container's own address, exactly as in [nginx](#nginx) above.
 
 ## Traefik with Docker labels
 
@@ -209,7 +243,9 @@ services:
       traefik.docker.network: proxy
       # Route the private callback to Next.js, where it is a guaranteed 404.
       # Priority 100 makes this rule win over the controller's /api prefix.
-      traefik.http.routers.subwave-auth-block.rule: "Host(`radio.example.com`) && Path(`/api/listener-auth`)"
+      # A case-insensitive prefix (Traefik v3 PathRegexp): the controller also
+      # answers a trailing slash and any case, which Path() would let through.
+      traefik.http.routers.subwave-auth-block.rule: "Host(`radio.example.com`) && PathRegexp(`(?i)^/api/listener-auth`)"
       traefik.http.routers.subwave-auth-block.entrypoints: websecure
       traefik.http.routers.subwave-auth-block.tls: "true"
       traefik.http.routers.subwave-auth-block.tls.certresolver: letsencrypt
@@ -227,6 +263,21 @@ networks:
   proxy:
     external: true
 ```
+
+Traefik sets `X-Forwarded-For` itself, but Icecast only reads it from a peer on
+its own trusted list — and on `docker-compose.byo.yml` there is no bundled
+Caddy for it to resolve by name, so real listener IPs need Traefik's own
+container address named in SUB/WAVE's `.env`:
+
+```bash
+# .env — Traefik's address on the `proxy` network (docker network inspect proxy).
+ICECAST_TRUSTED_PROXY_IPS=172.18.0.2
+```
+
+Icecast matches an **exact IP**, so a subnet is accepted and then never
+matches. Pin Traefik's address on that network if it moves between restarts.
+Without this every row in Admin → Listeners shows Traefik's container address
+instead of the listener's; the Listeners card says so when nothing was trusted.
 
 Traefik forwards response bodies as they arrive unless a buffering middleware
 is added, so the stream router needs no buffering option. Do not attach
@@ -437,13 +488,16 @@ curl -fsS "$BASE/api/health"
 curl -fsS "$BASE/listen.pls"
 curl -fsS "$BASE/listen.m3u"
 
-# The private Icecast callback must not reach the controller: expect 404/403.
-AUTH_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
-  -X POST "$BASE/api/listener-auth")
-case "$AUTH_STATUS" in
-  403|404) ;;
-  *) echo "listener-auth is public (HTTP $AUTH_STATUS)" >&2; exit 1 ;;
-esac
+# The private Icecast callback must not reach the controller: expect 404/403
+# for the exact path, a trailing slash and a case variant alike.
+for AUTH_PATH in /api/listener-auth /api/listener-auth/ /api/Listener-Auth; do
+  AUTH_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "$BASE$AUTH_PATH")
+  case "$AUTH_STATUS" in
+    403|404) ;;
+    *) echo "$AUTH_PATH is public (HTTP $AUTH_STATUS)" >&2; exit 1 ;;
+  esac
+done
 
 # Check the stream headers, then confirm a bounded GET receives audio bytes.
 curl -fsSI "$BASE/stream.mp3" | grep -i '^content-type:'

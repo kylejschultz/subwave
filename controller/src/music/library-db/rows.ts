@@ -2,11 +2,8 @@
 // column as JSON is parsed here, defensively — a row written by an older schema
 // version must degrade to null rather than throw a query.
 
-import type { TrackKeyRange, TrackOutro, TrackPaceSpan, TrackRecord, TrackRow, TrackSection } from './types.js';
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+import type { MoodPoolRecord, MoodPoolRow, EnergyPoolRecord, EnergyPoolRow, TrackKeyRange, TrackOutro, TrackPaceSpan, TrackRecord, TrackRow, TrackSection } from './types.js';
+import { parseVocalRangesJson } from '../lyric-vocal.js';
 
 export function rowToTrack(row: TrackRow): TrackRecord {
   return {
@@ -23,9 +20,8 @@ export function rowToTrack(row: TrackRow): TrackRecord {
     isCompilation: row.is_compilation == null ? null : !!row.is_compilation,
     eraUntrusted: row.era_untrusted == null ? null : !!row.era_untrusted,
     // The composed answer every era consumer reads. OR, not COALESCE: the two
-    // columns are independent evidence and either one alone is enough. A row
-    // not yet re-walked since the #1418 migration has era_untrusted NULL and
-    // still behaves exactly as it did under #842.
+    // columns are independent evidence and either alone is enough. A row not yet
+    // re-walked since the #1418 migration behaves exactly as it did under #842.
     yearUntrusted: (row.is_compilation === 1 || row.era_untrusted === 1)
       ? true
       : (row.is_compilation == null && row.era_untrusted == null ? null : false),
@@ -51,9 +47,7 @@ export function rowToTrack(row: TrackRow): TrackRecord {
     loudnessLufs: row.loudness_lufs ?? null,
     peakDb: row.peak_db ?? null,
     structure: row.structure_json ? safeParseSections(row.structure_json) : null,
-    // Preserve an empty array ("analysed instrumental"); only a SQL NULL column
-    // (not computed) maps to null. parseSpans keeps [] intact.
-    vocalRanges: row.vocal_ranges_json != null ? parseSpans(row.vocal_ranges_json) : null,
+    ...parseVocalRangesJson(row.vocal_ranges_json),
     pace: row.pace_json ? parsePaceSpans(row.pace_json) : null,
     beats: row.beats_json ? parseMsArray(row.beats_json) : null,
     bars: row.bars_json ? parseMsArray(row.bars_json) : null,
@@ -78,11 +72,10 @@ export function parseOutroJson(s: string): TrackOutro | null {
     if (ending !== 'fade' && ending !== 'cold') return null;
     const msList = (x: unknown): number[] | null =>
       Array.isArray(x) && x.length ? x.filter((n): n is number => Number.isFinite(n)) : null;
-    // Tail vocal spans: gate on KEY PRESENCE so absent stays null (not
-    // computed) while a present-but-empty array survives as [] (analysed
-    // instrumental tail). Malformed entries are dropped span-by-span — a
-    // wholesale []-on-malformed would fake the "measured instrumental"
-    // meaning and permanently satisfy the backfill's tail-missing probe.
+    // Gate on KEY PRESENCE: absent stays null (not computed), present-but-empty
+    // survives as [] (no detected tail vocals). Malformed entries drop
+    // span-by-span — a wholesale [] would fake "no tail vocals" and
+    // permanently satisfy the backfill's tail-missing probe.
     let vocalRanges: Array<{ startMs: number; endMs: number }> | null = null;
     if (Array.isArray(v?.vocalRanges)) {
       vocalRanges = [];
@@ -203,3 +196,29 @@ export function normaliseYear(y: unknown): number | null {
   return null;
 }
 
+
+export function rowToMoodPool(row: MoodPoolRow): MoodPoolRecord {
+  return {
+    id: row.id, title: row.title, artist: row.artist, album: row.album,
+    albumId: row.album_id ?? null, artistId: row.artist_id ?? null, year: row.year,
+    genres: row.genres ? safeParseArray(row.genres) : [], genre: row.genre,
+    moods: row.moods ? safeParseArray(row.moods) : [], energy: row.energy ?? null,
+    durationSec: row.duration_sec,
+  };
+}
+
+export function rowToEnergyPool(row: EnergyPoolRow): EnergyPoolRecord {
+  return {
+    ...rowToMoodPool(row),
+    originalYear: row.original_year ?? null,
+    isCompilation: row.is_compilation == null ? null : !!row.is_compilation,
+    yearUntrusted: (row.is_compilation === 1 || row.era_untrusted === 1)
+      ? true : (row.is_compilation == null && row.era_untrusted == null ? null : false),
+    audioMoods: row.audio_moods ? safeParseArray(row.audio_moods) : [],
+    bpm: row.bpm ?? null, musicalKey: row.musical_key ?? null,
+    introMs: row.intro_ms ?? null, loudnessLufs: row.loudness_lufs ?? null,
+    structure: row.structure_json ? safeParseSections(row.structure_json) : null,
+    ...parseVocalRangesJson(row.vocal_ranges_json),
+    pace: row.pace_json ? parsePaceSpans(row.pace_json) : null,
+  };
+}

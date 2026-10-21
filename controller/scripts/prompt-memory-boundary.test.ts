@@ -9,20 +9,22 @@
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { removeTempDir } from './test-utils/temp-dir.js';
 
 const root = mkdtempSync(join(tmpdir(), 'subwave-prompt-memory-'));
 process.env.STATE_DIR = root;
 
 const session = await import('../src/broadcast/session.js');
+const settings = await import('../src/settings.js');
 const { queue } = await import('../src/broadcast/queue.js');
 const scripts = await import('../src/llm/internal/prompts/scripts.js');
 const { exchangeSegment } = await import('../src/broadcast/queue/pure.js');
 
-after(() => {
-  rmSync(root, { recursive: true, force: true });
+after(async () => {
+  await removeTempDir(root);
 });
 
 function context(show: { id: string; name: string } | null, period = 'morning') {
@@ -106,6 +108,21 @@ test('the incoming greeting acknowledges the presenter without ingesting their r
   assert.doesNotMatch(prompt, /ceiling fan|flight plan/i);
 });
 
+test('the outgoing sign-off names its own show and excludes the incoming show context', () => {
+  assert.equal(typeof (scripts as any).signoffPrompt, 'function');
+  const prompt = (scripts as any).signoffPrompt({
+    personaOut: { name: 'Chris' },
+    personaIn: { name: 'Carrie' },
+    showOut: 'Morning Mixtape',
+    showIn: 'Lunchtime Rocks',
+    context: context({ id: 'lunch', name: 'Lunchtime Rocks' }),
+  });
+
+  assert.match(prompt, /Morning Mixtape/);
+  assert.match(prompt, /Carrie, who's bringing you "Lunchtime Rocks"/);
+  assert.doesNotMatch(prompt, /On now: the show "Lunchtime Rocks"/);
+});
+
 test("the outgoing DJ's sign-off still reads its own show's memory", async () => {
   queue.djLog = [];
   session.start(context({ id: 's_soft_start', name: 'The Soft Start Procedure' }));
@@ -180,6 +197,39 @@ function pushTurn(kind: string, text: string, agoMs: number) {
   });
 }
 
+test('saved DJ behaviour controls the recap defaults used by the queue', async () => {
+  await settings.update({
+    djBehaviour: { recapLimit: 2, recapMinutes: 30, recapChars: 40 },
+  } as never);
+  try {
+    queue.djLog = [];
+    session.start(context({ id: 's_tuned_recap', name: 'The Tuned Recap' }));
+    pushTurn('link', 'This old line sits beyond the configured time window.', 45 * 60_000);
+    pushTurn('link', 'The first recent line is deliberately longer than forty characters.', 3 * 60_000);
+    pushTurn('link', 'The second recent line is deliberately longer than forty characters.', 2 * 60_000);
+    pushTurn('link', 'The newest recent line is deliberately longer than forty characters.', 60_000);
+
+    const limited = queue.getDjRecap() || '';
+    const limitedLines = limited.split('\n');
+    assert.equal(limitedLines.length, 2, 'the saved line limit is the queue default');
+    assert.doesNotMatch(limited, /first recent|old line/);
+    for (const line of limitedLines) {
+      const quoted = line.match(/: "(.*)"$/)?.[1];
+      assert.equal(quoted?.length, 40, 'the saved character cap is the queue default');
+      assert.match(quoted || '', /…$/);
+    }
+
+    const widened = queue.getDjRecap({ limit: 50 }) || '';
+    assert.equal(widened.split('\n').length, 3, 'an explicit limit override still wins');
+    assert.match(widened, /first recent/);
+    assert.doesNotMatch(widened, /old line/, 'the saved time window remains the default');
+  } finally {
+    await settings.update({
+      djBehaviour: { recapLimit: 10, recapMinutes: 120, recapChars: 140 },
+    } as never);
+  }
+});
+
 test('the recap window measures from the newest turn, not the oldest', () => {
   queue.djLog = [];
   session.start(context({ id: 's_long_run', name: 'The Long Run' }));
@@ -206,7 +256,15 @@ test('the recap window measures from the newest turn, not the oldest', () => {
   ], 'openers carry no time cutoff of their own — only the recap does');
 });
 
-test('prompt memory survives a controller restart', async () => {
+test('prompt memory survives a controller restart', async (t) => {
+  const prior = structuredClone({ shows: settings.get().shows, schedule: settings.get().schedule });
+  t.after(() => settings.update(prior));
+  const week: Record<number, string[]> = {};
+  for (let day = 0; day < 7; day++) week[day] = Array(24).fill('s_resumed');
+  await settings.update({
+    shows: [{ id: 's_resumed', name: 'Resumed Session', topic: '', personaId: settings.get().personas[0].id }],
+    schedule: week,
+  });
   queue.djLog = [];
   const ctx = context({ id: 's_resumed', name: 'Resumed Session' });
   // What recover() actually reads: a session.json written by the previous

@@ -53,6 +53,11 @@ const defaultOwnershipRegistry = [
     consumers: [{ file: 'dash/TakeoverCard.tsx', owner: 'useAdminQuery', property: 'request', count: 1 }],
   },
   {
+    file: 'dash/queries.ts', function: 'fetchTakeoverWindow',
+    reads: [{ callee: 'adminJson', method: 'GET', path: '/schedule/next-change', signal: 'signal' }],
+    consumers: [{ file: 'dash/TakeoverCard.tsx', owner: 'useAdminQuery', property: 'request', count: 1 }],
+  },
+  {
     file: 'dash/queries.ts', function: 'fetchNavidromeStatus',
     reads: [{ callee: 'adminJson', method: 'GET', path: '/doctor/navidrome', signal: 'signal' }],
     consumers: [{ file: 'NavidromeBanner.tsx', owner: 'useAdminQuery', property: 'request', count: 1 }],
@@ -61,6 +66,11 @@ const defaultOwnershipRegistry = [
     file: 'dash/queries.ts', function: 'fetchMusicStarved',
     reads: [{ callee: 'adminJson', method: 'GET', path: '/state', signal: 'signal' }],
     consumers: [{ file: 'MusicStarvedBanner.tsx', owner: 'useAdminQuery', property: 'request', count: 1 }],
+  },
+  {
+    file: 'debug/queries.ts', function: 'fetchPlaybackFailures',
+    reads: [{ callee: 'adminJson', method: 'GET', path: '/debug/playback-failures', signal: 'signal' }],
+    consumers: [{ file: 'debug/PlaybackFailures.tsx', owner: 'useAdminQuery', property: 'request', count: 1 }],
   },
   {
     file: 'debug/queries.ts', function: 'fetchDebug',
@@ -77,6 +87,13 @@ const defaultOwnershipRegistry = [
     reads: [{ callee: 'adminJson', method: 'GET', path: '/playlists/${}', signal: 'signal' }],
     consumers: [
       { file: 'PlaylistBuilderPanel.tsx', owner: 'fetchQuery', property: 'queryFn', count: 2 },
+    ],
+  },
+  {
+    file: 'tts/geminiLibraryQueries.ts', function: 'fetchLibraryPage',
+    reads: [{ callee: 'adminJson', method: 'GET', path: '/settings/tts/voices?${}', signal: 'signal' }],
+    consumers: [
+      { file: 'tts/geminiLibraryQueries.ts', owner: 'useInfiniteQuery', property: 'queryFn', count: 1 },
     ],
   },
   {
@@ -106,10 +123,41 @@ const allowed = new Map([
   ])],
   ['BackupPanel.tsx', new Map([
     ['backup-export', { callee: 'adminResponse', method: 'GET', path: /^\/backup\/export$/ }],
+    // The stored file, byte for byte — export above builds a NEW archive, which
+    // is not the snapshot the operator clicked on. Same shape as
+    // archive-download next door.
+    ['backup-download-file', {
+      callee: 'adminResponse',
+      method: 'GET',
+      path: /^\/backup\/file\/\$\{\}$/,
+    }],
   ])],
   ['DoctorPanel.tsx', new Map([
     ['diagnosis-command', { callee: 'adminResponse', method: 'GET', path: /^\/doctor$/ }],
     ['diagnosis-stream', { callee: 'adminResponse', method: 'GET', path: /^\/doctor\/stream$/ }],
+  ])],
+  ['DiscoveryPanel.tsx', new Map([
+    ['discovery-tool-preview', { callee: 'adminJson', method: 'POST', path: /^\/debug\/discovery\/tool\/\$\{\}$/ }],
+    ['discovery-comparison-preview', { callee: 'adminJson', method: 'POST', path: /^\/debug\/discovery\/compare$/ }],
+  ])],
+  ['PersonasPanel.tsx', new Map([
+    // Persona bundle (#1620). A one-shot blob download, like backup-export and
+    // skill-export next door — the import half is an ordinary useAdminMutation.
+    ['persona-bundle-export', {
+      callee: 'adminResponse',
+      method: 'GET',
+      path: /^\/personas\/\$\{\}\/export$/,
+    }],
+  ])],
+  ['debug/PlaybackFailures.tsx', new Map([
+    ['playback-failure-export', { callee: 'adminResponse', method: 'GET', path: /^\/debug\/playback-failures\/export$/ }],
+  ])],
+  ['debug/LlmCalls.tsx', new Map([
+    ['llm-call-export', {
+      callee: 'adminResponse',
+      method: 'GET',
+      path: /^\/debug\/llm-calls\/export\?format=\$\{\}$/,
+    }],
   ])],
   ['connect/ConnectPanel.tsx', new Map([
     ['openapi-download', { callee: 'adminResponse', method: 'GET', path: /^catalog\.openapiPath$/ }],
@@ -128,6 +176,16 @@ const allowed = new Map([
     ['generation-job-start', { callee: 'rawFetcher', method: 'POST', path: /^\/playlists\/generate\/jobs$/ }],
     ['generation-sync-fallback', { callee: 'rawFetcher', method: 'POST', path: /^\/playlists\/generate$/ }],
     ['generation-job-poll', { callee: 'rawFetcher', method: 'GET', path: /^\/playlists\/generate\/jobs\/\$\{\}$/ }],
+  ])],
+  ['settings/LlmSection.tsx', new Map([
+    // The swap confirm dialog's preview: read once per dialog open, against
+    // settings and live latency that the swap it previews is about to change,
+    // so a cached copy would only ever be stale. Like discovery-tool-preview.
+    ['llm-swap-fit-preview', {
+      callee: 'adminResponse',
+      method: 'GET',
+      path: /^\/settings\/llm\/swap\/fit$/,
+    }],
   ])],
   ['settings/LibrarySection.tsx', new Map([
     ['locca-discovery-probe', {

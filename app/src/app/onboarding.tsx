@@ -1,9 +1,4 @@
-// First-launch (or "add station") screen, styled after the web mock's onboarding:
-// brand + lede, an https:// station-URL field, and a known-stations list. Picking
-// or entering a station runs a four-step health check (host → controller →
-// stream → DJ booth) with live pass/fail, then a result card to tune in. The
-// stepper is cosmetic scaffolding around the real probe — api.health() is the
-// gate; api.dj() best-effort fills the station name.
+// Only /health gates tune-in. The stepper is cosmetic; /dj supplies a name.
 
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
@@ -18,7 +13,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { ArrowLeftRight, ChevronDown, ChevronRight, ChevronUp, KeyRound } from 'lucide-react-native';
+import { ArrowLeftRight, ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, KeyRound } from 'lucide-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DiscMark from '@/components/DiscMark';
 import LiveDot from '@/components/LiveDot';
@@ -26,6 +21,7 @@ import StationLiveStatus from '@/components/StationLiveStatus';
 import { createApi, normalizeBase, type HealthResult, type StationApi } from '@/lib/api';
 import { useStation } from '@/config/StationContext';
 import { fetchDirectory, type DirectoryStation } from '@/lib/directory';
+import { PROJECT_LINKS, openExternal } from '@/lib/links';
 import type { StationRef } from '@/lib/station';
 import {
   splitStationAddress,
@@ -39,16 +35,11 @@ const STEPS = ['Resolving host', 'Controller · /health', 'Icecast · /stream', 
 type StepState = 'wait' | 'run' | 'ok' | 'fail';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const stripProto = (u: string) => u.replace(/^https?:\/\//, '');
-// Bare host (no scheme, port, or path), lowercased. Best-effort for hostnames
-// and IPv4 — an IPv6 literal isn't a realistic station address here.
+// Bare host, lowercased. Hostnames and IPv4 only; IPv6 literals aren't handled.
 const hostOf = (u: string) => stripProto(u).split('/')[0].split(':')[0].toLowerCase();
-// Private/reserved TLDs that never resolve on the public internet, so a
-// cleartext station behind one is a LAN box, not an exposed origin.
+// Reserved TLDs identify LAN stations.
 const PRIVATE_TLDS = /\.(local|lan|home|internal|corp|intranet|localdomain)$|\.home\.arpa$/;
-// A host where falling back to cleartext carries bounded MITM risk: loopback, a
-// single-label LAN name (http://nas), *.local mDNS, an RFC1918 address, or a
-// private TLD. These skip the insecure-downgrade consent prompt. Anything that
-// looks like a public domain does NOT — it takes the one-tap consent path.
+// Local hosts skip cleartext consent; public-looking hosts require it.
 const isLocalHost = (h: string) =>
   h === 'localhost' ||
   !h.includes('.') ||
@@ -75,18 +66,11 @@ function confirmCleartextLogin(): Promise<boolean> {
   });
 }
 
-// Recognise a TLS "the server's CA isn't trusted" failure from the raw error
-// (Android: "Trust anchor for certification path not found" /
-// CertPathValidatorException; iOS: certificate invalid / not trusted). The app
-// trusts user-installed CAs (see plugins/withAndroidUserCaTrust.js), so when
-// this still fires the CA simply isn't installed/trusted on THIS device.
+// TLS "CA isn't trusted" failure, spelt differently per platform (Android:
+// trust anchor / CertPathValidatorException; iOS: certificate invalid).
 const isUntrustedCa = (msg?: string) =>
   !!msg && /trust anchor|certpathvalidator|certification path|certificate.*(invalid|not trusted)/i.test(msg);
 
-// Turn a failed health probe into a human diagnostic for the failure card. The
-// network case names the usual "works in the browser, fails in the app" culprit
-// (a TLS chain Android rejects but the browser tolerates) — the most common and
-// least obvious cause for an otherwise-valid HTTPS station.
 function describeFail(
   fail: HealthResult | null,
   usedCredentials: boolean,
@@ -95,32 +79,18 @@ function describeFail(
   if (!fail || fail.ok) return undefined;
   if (fail.kind === 'timeout')
     return 'No response in time — the box may be asleep, on another network, or blocked by a firewall.';
-  // 401 is its own diagnosis, not a routing problem: the station sits behind
-  // HTTP Basic Auth (auth_basic on the reverse proxy, or SUB/WAVE's own stream
-  // password), and the generic "check your /api/* route" advice below sends
-  // people hunting a proxy bug that isn't there — the reported symptom is
-  // "works in the browser, in VLC and in curl, fails in the app" (#1300, bug
-  // 8). Split on whether this probe carried the first-class login fields: if it
-  // did, the credentials were rejected; otherwise direct the listener back to
-  // those fields instead of the old user:pass@host syntax.
+  // 401 needs station credentials; generic proxy-routing advice is misleading.
   if (fail.kind === 'http' && fail.status === 401)
     return usedCredentials
       ? 'The station rejected this login (HTTP 401). Go back and check the username and password.'
       : 'The station asked for a login (HTTP 401). Go back, open Station login, and enter its username and password.';
-  // 407 comes from a proxy between THIS DEVICE and the station, not from the
-  // station — credentials in the station address never reach it, so the advice
-  // above would be actively wrong here.
+  // 407 needs proxy credentials, not station credentials.
   if (fail.kind === 'http' && fail.status === 407)
     return "A proxy on this network is asking for a password (HTTP 407) — that sits between this device and the station, so credentials in the station address never reach it. Check this network's proxy settings, or try another network.";
   if (fail.kind === 'http')
     return `The server answered with HTTP ${fail.status ?? '?'}, so the address is reachable but the request never reached the controller. Check that your reverse proxy routes /api/* to the controller on port 7701.`;
-  // The device doesn't trust the station's cert. Two real-world causes, same
-  // error: (1) a public chain whose root is too NEW for an older phone's trust
-  // store — fixed server-side by serving a cross-signed intermediate back to an
-  // older trusted root (issue #458: Sectigo R46 unknown to Android 12); or (2) a
-  // private/self-signed CA. The app trusts user-installed CAs
-  // (plugins/withAndroidUserCaTrust.js), so installing the root on the device
-  // also works for either case.
+  // A new root missing from an older trust store and a private CA cause the
+  // same error. User-installed CAs are supported by withAndroidUserCaTrust.js.
   if (isUntrustedCa(fail.message)) {
     const install =
       Platform.OS === 'ios'
@@ -144,8 +114,6 @@ export default function Onboarding() {
   const { featured, recents, selectStation, credentialsFor, base } = useStation();
   const { colors } = useTheme();
   const addMode = !!base;
-  // Deep-link from the Stations "Discover" list: prefill + jump straight to the
-  // health-check instead of the entry form.
   const params = useLocalSearchParams<{ url?: string; name?: string }>();
   const autoRan = useRef(false);
 
@@ -155,25 +123,18 @@ export default function Onboarding() {
   const [target, setTarget] = useState<Target | null>(null);
   const [done, setDone] = useState(false);
   const [failed, setFailed] = useState(false);
-  // True when the resolved station is cleartext http on a non-local host —
-  // gates "Tune in" behind an explicit consent button.
   const [insecure, setInsecure] = useState(false);
-  // Scheme for the manual entry field. https is the friendly default (a bare
-  // host still auto-falls back to http); switching to http forces cleartext for
-  // HTTP-only boxes. An explicit scheme typed into the field always wins.
+  // An explicit scheme wins; bare hosts try HTTPS first, with HTTP fallback.
   const [scheme, setScheme] = useState<'https' | 'http'>('https');
   const [showLogin, setShowLogin] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  // Diagnostic + raw error for the failure card, set by runCheck on a dead probe.
   const [failDetail, setFailDetail] = useState<string | undefined>(undefined);
   const [failRaw, setFailRaw] = useState<string | undefined>(undefined);
   const [tuneError, setTuneError] = useState<string | undefined>(undefined);
   const [directory, setDirectory] = useState<DirectoryStation[]>([]);
   const runId = useRef(0);
 
-  // Pull the community directory so a fresh installer can browse beyond the
-  // bundled featured station — same source the Stations switcher discovers from.
   useEffect(() => {
     const ctrl = new AbortController();
     fetchDirectory(ctrl.signal).then((list) => setDirectory(list));
@@ -182,7 +143,6 @@ export default function Onboarding() {
 
   const known: StationRef[] = [featured, ...recents.filter((r) => r.url !== featured.url)];
 
-  // Discover = directory minus anything already in the known list, minus dupes.
   const knownKeys = new Set(known.map((r) => normalizeBase(r.url)));
   const discoverRows = directory.filter((st) => {
     const k = normalizeBase(st.url);
@@ -234,9 +194,7 @@ export default function Onboarding() {
     }
     if (runId.current !== id) return;
 
-    // A login must never ride an automatic HTTPS→HTTP fallback. An explicit
-    // http:// address remains supported, but consent happens before any probe
-    // can put the Basic credentials on the wire.
+    // Require explicit HTTP consent before any probe sends Basic credentials in cleartext.
     const candidates = stationProbeCandidates(trimmed, !!activeCredentials)
       .map((candidate) => normalizeBase(candidate))
       .filter(Boolean);
@@ -266,10 +224,6 @@ export default function Onboarding() {
       setSteps((prev) => (runId.current === id ? prev.map((v, idx) => (idx === i ? s : v)) : prev));
     const alive = () => runId.current === id;
 
-    // Hit one candidate's controller /health behind its own timeout. Returns
-    // the live StationApi on success, or a structured failure (timeout / http /
-    // network) so the caller can try the next candidate and, if all fail, show
-    // a real diagnostic instead of a bare "failed".
     const probe = async (candidate: string): Promise<{ api: StationApi } | { fail: HealthResult }> => {
       const api = createApi(candidate, activeCredentials);
       const ctrl = new AbortController();
@@ -286,13 +240,12 @@ export default function Onboarding() {
     };
 
     try {
-      // 1 · Resolving host (cosmetic)
       set(0, 'run');
       await sleep(420);
       if (!alive()) return;
       set(0, 'ok');
 
-      // 2 · Controller /health — the real gate. Try each candidate in turn.
+      // Only the controller health response gates tune-in.
       set(1, 'run');
       let api: StationApi | null = null;
       let base = first;
@@ -321,12 +274,11 @@ export default function Onboarding() {
           setShowLogin(true);
         }
         const raw = lastFail && !lastFail.ok ? lastFail.message : undefined;
-        // The Android generic carries no detail; iOS often surfaces a useful one.
+        // Android often hides network error detail; iOS may supply a diagnostic.
         setFailRaw(raw && raw !== 'Network request failed' ? raw : undefined);
         setFailed(true);
         return;
       }
-      // Re-point the target at the candidate that actually answered.
       const fallbackName = presetName || stripProto(base);
       setTarget({
         base,
@@ -334,21 +286,16 @@ export default function Onboarding() {
         name: fallbackName,
         credentials: activeCredentials,
       });
-      // Flag cleartext on a non-local host — whether the probe silently fell
-      // back from https (an on-path attacker could force that by blocking the
-      // https attempt) or the listener picked http explicitly. Either way a
-      // public-looking host over plain HTTP needs one-tap consent; local hosts
-      // carry bounded risk and skip it.
+      // Require cleartext consent for public hosts, including explicit HTTP choices.
       setInsecure(base.startsWith('http://') && !isLocalHost(hostOf(base)));
       set(1, 'ok');
 
-      // 3 · Icecast /stream (cosmetic — controller answered, mount assumed up)
+      // This step is cosmetic; a healthy controller is assumed to have a live mount.
       set(2, 'run');
       await sleep(380);
       if (!alive()) return;
       set(2, 'ok');
 
-      // 4 · DJ booth — best-effort name resolution
       set(3, 'run');
       let name = fallbackName;
       const ctrl = new AbortController();
@@ -377,18 +324,14 @@ export default function Onboarding() {
     if (!target) return;
     setTuneError(undefined);
     try {
-      // selectStation tears down any current playback before re-pointing.
       await selectStation(
         { url: target.base, name: target.name },
         target.credentials,
       );
       if (addMode) {
-        // Came here from the stations modal ([index, stations, onboarding]) —
-        // unwind to the existing root player. replace() would stack a second
-        // player screen inside the modal (overlapping screens).
+        // replace would stack another player inside the modal; unwind to the existing one.
         router.dismissTo('/');
       } else {
-        // First run: onboarding IS the root — swap it for the player.
         router.replace('/');
       }
     } catch {
@@ -403,8 +346,6 @@ export default function Onboarding() {
     setPhase('entry');
   };
 
-  // Manual-entry submit. An explicit scheme typed into the field wins; otherwise
-  // https keeps the bare-host auto-fallback (https→http) and http forces cleartext.
   const submitEntry = () => {
     const h = host.trim();
     if (!h) return;
@@ -415,7 +356,6 @@ export default function Onboarding() {
     else runCheck(scheme === 'http' ? `http://${h}` : h, undefined, credentials);
   };
 
-  // Auto-run the probe once when arriving with a prefilled station (Discover).
   useEffect(() => {
     if (autoRan.current || !params.url) return;
     autoRan.current = true;
@@ -431,7 +371,6 @@ export default function Onboarding() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {/* Brand */}
           <View className="flex-row items-center" style={{ gap: 10, marginBottom: 6 }}>
             <DiscMark size={22} />
             <Text className="font-mono text-ink" style={{ fontSize: 18, letterSpacing: 1, fontWeight: '800' }}>
@@ -453,7 +392,6 @@ export default function Onboarding() {
                 stream, one broadcast: you join whatever&apos;s on.
               </Text>
 
-              {/* URL field with a tappable scheme toggle (https ⇄ http) */}
               <View
                 className="flex-row items-center"
                 style={{ marginTop: 18, borderWidth: 1, borderColor: colors.muted, backgroundColor: colors.field }}
@@ -603,7 +541,6 @@ export default function Onboarding() {
                 </Text>
               </Pressable>
 
-              {/* Known stations */}
               <View className="flex-row items-center" style={{ gap: 10, paddingTop: 18, paddingBottom: 4 }}>
                 <Text className="font-mono text-muted" style={{ fontSize: 10, letterSpacing: 2.2, textTransform: 'uppercase', fontWeight: '700' }}>
                   {addMode ? 'Known stations' : 'Or pick a known station'}
@@ -635,7 +572,6 @@ export default function Onboarding() {
                 ))}
               </View>
 
-              {/* Discover — community directory stations not already listed above */}
               {discoverRows.length ? (
                 <>
                   <View className="flex-row items-center" style={{ gap: 10, paddingTop: 18, paddingBottom: 4 }}>
@@ -674,6 +610,24 @@ export default function Onboarding() {
                   </View>
                 </>
               ) : null}
+
+              <Pressable
+                onPress={() => openExternal(PROJECT_LINKS.setup)}
+                accessibilityRole="link"
+                accessibilityLabel="No station yet? Read the guide to run your own"
+                style={{ marginTop: 18, paddingVertical: 12, borderTopWidth: 1, borderTopColor: colors.softBorder }}
+              >
+                <View className="flex-row items-center" style={{ gap: 6 }}>
+                  <Text className="font-body-semibold text-ink" style={{ fontSize: 14 }}>
+                    No station yet? Run your own
+                  </Text>
+                  <ArrowUpRight size={15} color={colors.accent} />
+                </View>
+                <Text className="font-body text-muted" style={{ fontSize: 12.5, lineHeight: 18, marginTop: 3 }}>
+                  Your music library, a language model and a machine running Docker. The setup guide
+                  walks you through it.
+                </Text>
+              </Pressable>
 
               {addMode ? (
                 <Pressable onPress={() => router.back()} accessibilityRole="button" accessibilityLabel="Back to player" className="items-start" style={{ marginTop: 8, paddingVertical: 8 }}>

@@ -1,10 +1,12 @@
 'use client';
 
 import type { ChangeEvent } from 'react';
+import { settingsForm } from './settings/form-state';
+import { atPath, samePath, sameForm, countLeafDiffs, dirtyPaths, restorePaths, ownsErrorPath, mergePatchErrors, unsavedAnywhere } from './settings/form-diff';
+import { archivesSavePayload, dangerSavePayload } from './settings/save-payload';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { notify, errorMessage } from '../../lib/notify';
-import { normalizeStationLocale } from '../../lib/format';
 import { useAdminAuth } from '../../lib/adminAuth';
 import {
   AdminResponseError,
@@ -20,6 +22,7 @@ import { Card, Btn, Pill, Seg } from './ui';
 import { SkeletonForm } from '@/components/ui/skeleton';
 import { ErrorState } from '@/components/ui/error-state';
 import { cn } from '../../lib/cn';
+import { fieldAria } from '../../lib/form';
 import ArchivesPanel from './ArchivesPanel';
 import BackupPanel from './BackupPanel';
 import {
@@ -29,9 +32,9 @@ import {
 } from '@/lib/schemas.generated';
 import { AlertTriangle } from 'lucide-react';
 import {
-  SectionHeader, SaveBar, SettingsFieldError, ELEVENLABS_VS_DEFAULTS, FISH_TTS_DEFAULTS,
+  SectionHeader, SaveBar, SettingsFieldError,
   type FormState, type FormUpdater, type SettingsData, type SaveSettings,
-  type LoudnessSource, type LlmForm, type LlmFallbackForm,
+  type LoudnessSource, type TransitionEffect,
 } from './settings/shared';
 import {
   SECTIONS, SECTION_GROUPS, RESTART_PATHS, sectionById, type SectionId,
@@ -39,72 +42,61 @@ import {
 import { Advanced, SectionChromeProvider } from './settings/section-chrome';
 import { SettingsSearch, type SettingsJump } from './settings/SettingsSearch';
 import { TtsSection } from './settings/TtsSection';
+import { DjBehaviourSection } from './settings/DjBehaviourSection';
 import { LlmSection } from './settings/LlmSection';
+import { BrainSection } from './settings/BrainSection';
 import { SearchSection } from './settings/SearchSection';
 import { LibrarySection } from './settings/LibrarySection';
 import { StationSection } from './settings/StationSection';
 import { ThemeSection } from './settings/ThemeSection';
-import { ScrobbleSection } from './settings/ScrobbleSection';
-import { LikesSection } from './settings/LikesSection';
+import { ListenersSection } from './settings/ListenersSection';
 import { NavidromeSection } from './settings/NavidromeSection';
+import { MusicSelectionSection } from './settings/MusicSelectionSection';
 import {
+  useLlmSwapMutation,
   useSettingsMutation,
   useSettingsQuery,
 } from './settings/queries';
+import {
+  cloudSaveSnapshot, cloudSaveReadReady, rebaselineSavedPatch, reconcileSavedCloud,
+  adoptServerPaths, committedReadReady, LLM_SWAP_FORM_KEYS,
+  type PendingCloudSave, type PendingCommittedRead,
+} from './settings/form-reconciliation';
 
-/**
- * Read one dotted path out of the form. Returns undefined for a missing branch
- * rather than throwing, so a path that names a key a given settings.json has
- * never carried compares equal on both sides and reads as clean.
- */
-function atPath(form: FormState | null, path: string): unknown {
-  let node: unknown = form;
-  for (const key of path.split('.')) {
-    if (!node || typeof node !== 'object') return undefined;
-    node = (node as Record<string, unknown>)[key];
-  }
-  return node;
-}
-
-const samePath = (a: FormState | null, b: FormState | null, path: string) =>
-  JSON.stringify(atPath(a, path) ?? null) === JSON.stringify(atPath(b, path) ?? null);
-
-/**
- * How many individual controls differ between two form branches.
- *
- * Counting LEAVES, not top-level keys: `requests` is one key holding seven
- * fields, and "1 unsaved change" under a card where the operator just edited
- * three of them reads as a bug in the counter.
- */
-function countLeafDiffs(a: unknown, b: unknown): number {
-  if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) return 0;
-  const plain = (v: unknown): v is Record<string, unknown> =>
-    !!v && typeof v === 'object' && !Array.isArray(v);
-  // An array is one control (the TTS corrections list, the compat params
-  // table), not one control per row.
-  if (!plain(a) || !plain(b)) return 1;
-  let n = 0;
-  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
-    n += countLeafDiffs(a[key], b[key]);
-  }
-  return n;
-}
-
-/**
- * The paths a section owns that differ from the last saved baseline.
- *
- * Diffing against the BASELINE rather than the server's current values is what
- * makes the count survive the 3s refetch: the baseline only moves when a save
- * succeeds, so an operator mid-edit keeps seeing their own change count.
- */
-function dirtyPaths(
-  form: FormState | null,
-  baseline: FormState | null,
-  paths: readonly string[],
-): string[] {
-  if (!form || !baseline) return [];
-  return paths.filter(path => !samePath(form, baseline, path));
-}
+// Operator copy for the shared transition vocabulary. The drift test keeps
+// these labels in the schema's order and ensures every gesture has a hint.
+const TRANSITION_EFFECT_FIELDS = [
+  {
+    id: 'sweep',
+    label: 'Sweep',
+    hint: 'The outgoing track sinks under a closing filter while the next one rises clean — the dramatic gear-change across a clashing pair.',
+  },
+  {
+    id: 'washout',
+    label: 'Washout',
+    hint: 'A track dissolves into a tempo-synced echo tail as it ends. Also what makes an over-length track cut by the length cap sound intentional, so switching it off leaves those cuts as plain crossfades.',
+  },
+  {
+    id: 'blend',
+    label: 'Blend',
+    hint: 'A spectral handover between two tempo- and key-locked tracks, so the pair reads as one continuous piece.',
+  },
+  {
+    id: 'dissolve',
+    label: 'Dissolve',
+    hint: 'The outgoing track melts into a beatless reverb wash under the incoming one — the smooth way to hide a jump. The most expensive gesture in the kit: it runs on Liquidsoap\u2019s single streaming thread, so switch it off first if the mixer reports catch-up warnings on a slow host.',
+  },
+  {
+    id: 'chop',
+    label: 'Chop',
+    hint: 'The outgoing track is cut on its own beat, stabs thinning as the next rises through the gaps — the percussive way to lift the energy.',
+  },
+  {
+    id: 'loop',
+    label: 'Exit loop',
+    hint: 'A track\u2019s final bar repeats under whatever follows before it cuts away. Needs the track\u2019s measured tempo.',
+  },
+] as const satisfies readonly { id: TransitionEffect; label: string; hint: string }[];
 
 // The three encoder vocabularies, from the mirror rather than re-typed. radio.liq
 // has a literal `%mp3(bitrate=…)` branch per value, so each set is genuinely
@@ -116,50 +108,6 @@ const OPUS_BITRATES = SETTINGS_OPUS_BITRATES;
 const AAC_BITRATES = SETTINGS_AAC_BITRATES;
 
 /**
- * Settings keys a save posts under a name the FormState does NOT use.
- *
- * `rebaselineSavedPatch` already re-homes the VALUES (audio.stemCache* is edited
- * as `transitions.*`); anything that scopes by FormState key has to follow the
- * same map or it misses the alias. Discard is the case that bites: rolling back
- * `transitions` while leaving the `audio.stemCacheGb` message on screen parks an
- * error under a value that no longer produced it.
- */
-const FORM_KEY_ALIASES: Record<string, readonly string[]> = {
-  transitions: ['audio'],
-};
-
-/** Does `path` belong to any of these FormState keys, alias included? */
-function ownsErrorPath(formKeys: readonly string[], path: string): boolean {
-  const under = (key: string) => path === key || path.startsWith(`${key}.`);
-  return formKeys.some(key => under(key) || (FORM_KEY_ALIASES[key] ?? []).some(under));
-}
-
-/**
- * Replace exactly the errors belonging to the keys this patch carried.
- *
- * Scoped by TOP-LEVEL key, because that is the unit a save button posts and the
- * unit the controller reports against: a `{beds: …}` save owns every
- * `beds.*` error and nothing else. Merging blindly would let a fixed field keep
- * showing its old message; clearing everything would wipe an unrelated
- * section's unresolved error the moment any other control saved.
- */
-function mergePatchErrors(
-  prev: Record<string, string>,
-  patch: Record<string, unknown>,
-  next: Record<string, string> | undefined,
-): Record<string, string> {
-  const owned = Object.keys(patch);
-  const isOwned = (path: string) =>
-    owned.some((key) => path === key || path.startsWith(`${key}.`));
-  const out: Record<string, string> = {};
-  for (const [path, message] of Object.entries(prev)) {
-    if (!isOwned(path)) out[path] = message;
-  }
-  for (const [path, message] of Object.entries(next || {})) out[path] = message;
-  return out;
-}
-
-/**
  * How long a search jump waits for its target card to mount, in animation
  * frames (~1s at 60Hz). Generous on purpose: the cost of waiting is invisible
  * — the scroll simply happens on the frame the card appears — while the cost of
@@ -167,92 +115,11 @@ function mergePatchErrors(
  */
 const JUMP_MAX_FRAMES = 60;
 
-/**
- * Collector for the number boxes in a whole-block save.
- *
- * Archives and the danger zone post EVERY field on every click, so a box the
- * operator cleared and has not refilled rides along with whatever they actually
- * edited — and neither JS coercion fails safely there. `Number('')` is 0, which
- * is a VALID listener buffer and a valid retention window, so saving an AAC
- * toggle would quietly set the buffer to 0s and flag a mixer restart.
- * `parseInt('')` is NaN, which JSON.stringify posts as `null` and fails the
- * whole block with a message pointing at a field nobody touched.
- *
- * So a blank box refuses the save and names itself instead. An explicitly typed
- * `0` still parses, which is what keeps "0 = no limit" on max track length.
- */
-function numberFields() {
-  const bad: Record<string, string> = {};
-  const read = (path: string, raw: string, parse: (s: string) => number) => {
-    const text = String(raw).trim();
-    // Blank is checked before the parser, not by it: Number('') is a finite 0.
-    const n = text ? parse(text) : NaN;
-    if (Number.isFinite(n)) return n;
-    bad[path] = 'enter a number';
-    return 0;
-  };
-  return {
-    bad,
-    int: (path: string, raw: string) => read(path, raw, t => parseInt(t, 10)),
-    float: (path: string, raw: string) => read(path, raw, t => parseFloat(t)),
-    num: (path: string, raw: string) => read(path, raw, Number),
-  };
-}
-
-const sameForm = (a: FormState, b: FormState) => JSON.stringify(a) === JSON.stringify(b);
-
-/** Mark only the fields represented by a successful patch as clean. */
-function rebaselineSavedPatch(
-  baseline: FormState,
-  current: FormState,
-  patch: Record<string, unknown>,
-): FormState {
-  const next = JSON.parse(JSON.stringify(baseline)) as FormState;
-  const isRecord = (value: unknown): value is Record<string, unknown> =>
-    !!value && typeof value === 'object' && !Array.isArray(value);
-  const adopt = (
-    target: Record<string, unknown>,
-    source: Record<string, unknown>,
-    shape: Record<string, unknown>,
-  ) => {
-    for (const [key, value] of Object.entries(shape)) {
-      if (!(key in source)) continue;
-      if (isRecord(value) && isRecord(target[key]) && isRecord(source[key])) {
-        adopt(target[key], source[key], value);
-      } else {
-        target[key] = source[key];
-      }
-    }
-  };
-
-  const nextRecord = next as unknown as Record<string, unknown>;
-  const currentRecord = current as unknown as Record<string, unknown>;
-  for (const [key, value] of Object.entries(patch)) {
-    if (key === 'audio' && isRecord(value)) {
-      adopt(
-        next.transitions as unknown as Record<string, unknown>,
-        current.transitions as unknown as Record<string, unknown>,
-        value,
-      );
-      continue;
-    }
-    if (key === 'tts' && isRecord(value)) {
-      adopt(
-        next.tts as unknown as Record<string, unknown>,
-        current.tts as unknown as Record<string, unknown>,
-        value,
-      );
-      if (isRecord(value.kokoro) && 'lang' in value.kokoro) {
-        next.kokoroLang = current.kokoroLang;
-      }
-      continue;
-    }
-    adopt(nextRecord, currentRecord, { [key]: value });
-  }
-  return next;
-}
-
-export default function SettingsPanel() {
+export default function SettingsPanel({ djBrainEnabled = false }: { djBrainEnabled?: boolean }) {
+  const sections = useMemo(
+    () => SECTIONS.filter(s => s.id !== 'brain' || djBrainEnabled),
+    [djBrainEnabled],
+  );
   const { adminFetch, needsAuth, hydrated } = useAdminAuth();
   const settingsQuery = useSettingsQuery<SettingsData>({
     adminFetch,
@@ -266,11 +133,17 @@ export default function SettingsPanel() {
   const formBaselineRef = useRef<FormState | null>(null);
   const appliedRevisionRef = useRef(0);
   const pendingFormRevisionRef = useRef<{ revision: number; form: FormState } | null>(null);
+  const [pendingCloudSave, setPendingCloudSave] = useState<PendingCloudSave | null>(null);
+  // A committed LLM swap whose llm/embedding keys still have to be adopted from
+  // a read that reflects it (see the hydration effect).
+  const [pendingSwapRead, setPendingSwapRead] = useState<PendingCommittedRead | null>(null);
   const [pendingRestart, setPendingRestart] = useState(false);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
   const [activeSection, setActiveSection] = useState<SectionId>('station');
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const lengthModeAria = fieldAria('max-track-length-mode',
+    fieldErrors.maxTrackLengthMode ? { message: fieldErrors.maxTrackLengthMode } : undefined);
   // Portal target for the one sticky save bar. Null while nothing is unsaved,
   // which is what makes every section's SaveBar render nothing when clean.
   const [saveSlot, setSaveSlot] = useState<HTMLElement | null>(null);
@@ -288,7 +161,8 @@ export default function SettingsPanel() {
   const refresh = async () => { await settingsQuery.refetch(); };
 
   const saveMutation = useSettingsMutation<SettingsData>({ adminFetch });
-  const busy = commandBusy || saveMutation.isPending;
+  const swapMutation = useLlmSwapMutation<SettingsData>({ adminFetch });
+  const busy = commandBusy || saveMutation.isPending || swapMutation.isPending;
 
   // Jingles / SFX / Beds now live on /admin/imaging; their old ?section
   // deep-links are forwarded so existing bookmarks survive. Read through
@@ -297,278 +171,85 @@ export default function SettingsPanel() {
   // only the query changes.
   const searchParams = useSearchParams();
   useEffect(() => {
-    const s = searchParams.get('section');
-    if (s === 'jingles' || s === 'sfx' || s === 'beds') {
-      router.replace(`/admin/imaging?tab=${s}`);
+    const requested = searchParams.get('section');
+    if (requested === 'jingles' || requested === 'sfx' || requested === 'beds') {
+      router.replace(`/admin/imaging?tab=${requested}`);
       return;
     }
-    if (s && SECTIONS.some(x => x.id === s)) setActiveSection(s as SectionId);
-  }, [router, searchParams]);
+    // Retired tab ids, so an old bookmark or doc link still lands somewhere.
+    const RENAMED: Record<string, SectionId> = { danger: 'broadcast', likes: 'listeners', scrobble: 'listeners' };
+    const s = requested && RENAMED[requested] ? RENAMED[requested] : requested;
+    if (s === 'brain' && !djBrainEnabled) {
+      setActiveSection('station');
+      return;
+    }
+    if (s && sections.some(x => x.id === s)) setActiveSection(s as SectionId);
+  }, [router, searchParams, sections, djBrainEnabled]);
 
   useEffect(() => {
     if (!data?.values) return;
-    const v = data.values;
-    const nextForm: FormState = {
-      crossfadeDuration: String(v.crossfadeDuration ?? ''),
-      maxTrackSeconds: String(v.maxTrackSeconds ?? 0),
-      silenceTrim: {
-        enabled: v.silenceTrim?.enabled ?? false,
-        minGapMs: String(v.silenceTrim?.minGapMs ?? 1500),
-      },
-      transitions: {
-        pairDrain: v.transitions?.pairDrain ?? true,
-        stemBlends: v.transitions?.stemBlends ?? false,
-        stemCache: v.audio?.stemCache ?? false,
-        stemCacheGb: String(v.audio?.stemCacheGb ?? 15),
-      },
-      archive: {
-        enabled: v.archive?.enabled ?? false,
-        bitrate: String(v.archive?.bitrate ?? 128),
-        retentionDays: String(v.archive?.retentionDays ?? 30),
-      },
-      stream: {
-        opusEnabled: v.stream?.opusEnabled ?? true,
-        opusBitrate: String(v.stream?.opusBitrate ?? 96),
-        flacEnabled: v.stream?.flacEnabled ?? false,
-        aacEnabled: v.stream?.aacEnabled ?? false,
-        aacBitrate: String(v.stream?.aacBitrate ?? 192),
-        bitrate: String(v.stream?.bitrate ?? 192),
-        bufferSeconds: String(v.stream?.bufferSeconds ?? 22),
-        oggIcyMetadata: v.stream?.oggIcyMetadata ?? true,
-        idleWhenEmpty: v.stream?.idleWhenEmpty ?? false,
-        idleAfterMinutes: String(v.stream?.idleAfterMinutes ?? 10),
-        maxListeners: String(v.stream?.maxListeners ?? 100),
-      },
-      loudness: {
-        targetLufs: String(v.loudness?.targetLufs ?? -14),
-        maxBoostDb: String(v.loudness?.maxBoostDb ?? 6),
-        source: v.loudness?.source ?? 'replaygain-then-measured',
-      },
-      station: v.station ?? '',
-      stationDescription: v.stationDescription ?? '',
-      timezone: v.timezone ?? '',
-      locale: normalizeStationLocale(v.locale),
-      privacy: {
-        privatePlayer: v.privacy?.privatePlayer ?? false,
-        listenerAuth: v.privacy?.listenerAuth ?? false,
-        // Arrives as the 'set' sentinel ('' when unset) — never the secret.
-        password: v.privacy?.password ?? '',
-        publishPersonaSouls: v.privacy?.publishPersonaSouls ?? false,
-      },
-      requests: {
-        enabled: v.requests?.enabled !== false,
-        maxPending: String(v.requests?.maxPending ?? 6),
-        cooldownSec: String(v.requests?.cooldownSec ?? 60),
-        perIpHourlyCap: String(v.requests?.perIpHourlyCap ?? 8),
-        globalHourlyCap: String(v.requests?.globalHourlyCap ?? 30),
-        repeatCooldownMin: String(v.requests?.repeatCooldownMin ?? 120),
-        onePendingPerIp: v.requests?.onePendingPerIp !== false,
-      },
-      kokoroLang: v.tts?.kokoro?.lang ?? '',
-      weather: {
-        lat: String(v.weather?.lat ?? ''),
-        lng: String(v.weather?.lng ?? ''),
-        locationName: v.weather?.locationName ?? '',
-        onAirLocation: v.weather?.onAirLocation ?? '',
-        units: v.weather?.units === 'imperial' ? 'imperial' : 'metric',
-      },
-      tts: {
-        // Absent (a settings.json predating the key) reads as ON, matching the
-        // controller's own coercion in settings.load().
-        enabled: v.tts?.enabled !== false,
-        defaultEngine: v.tts?.defaultEngine ?? 'piper',
-        // Absent block = off, matching the controller's normalizeTtsFallback().
-        fallback: {
-          enabled: v.tts?.fallback?.enabled === true,
-          engine: v.tts?.fallback?.engine ?? 'piper',
-          voice: v.tts?.fallback?.voice ?? '',
-          cloudProvider: v.tts?.fallback?.cloudProvider ?? 'openai',
-        },
-        kokoro: { voice: v.tts?.kokoro?.voice ?? 'bf_isabella' },
-        chatterbox: { referenceVoice: v.tts?.chatterbox?.referenceVoice ?? '' },
-        pocketTts: { voice: v.tts?.pocketTts?.voice ?? 'alba' },
-        cloud: {
-          enabled: v.tts?.cloud?.enabled ?? false,
-          provider: v.tts?.cloud?.provider ?? 'openai',
-          model: v.tts?.cloud?.model ?? '',
-          voice: v.tts?.cloud?.voice ?? '',
-          baseUrl: v.tts?.cloud?.baseUrl ?? '',
-          voiceStability: typeof v.tts?.cloud?.voiceStability === 'number' ? v.tts.cloud.voiceStability : ELEVENLABS_VS_DEFAULTS.voiceStability,
-          voiceStyle: typeof v.tts?.cloud?.voiceStyle === 'number' ? v.tts.cloud.voiceStyle : ELEVENLABS_VS_DEFAULTS.voiceStyle,
-          voiceSimilarityBoost: typeof v.tts?.cloud?.voiceSimilarityBoost === 'number' ? v.tts.cloud.voiceSimilarityBoost : ELEVENLABS_VS_DEFAULTS.voiceSimilarityBoost,
-          voiceUseSpeakerBoost: typeof v.tts?.cloud?.voiceUseSpeakerBoost === 'boolean' ? v.tts.cloud.voiceUseSpeakerBoost : ELEVENLABS_VS_DEFAULTS.voiceUseSpeakerBoost,
-          temperature: typeof v.tts?.cloud?.temperature === 'number' ? v.tts.cloud.temperature : FISH_TTS_DEFAULTS.temperature,
-          topP: typeof v.tts?.cloud?.topP === 'number' ? v.tts.cloud.topP : FISH_TTS_DEFAULTS.topP,
-          latency: v.tts?.cloud?.latency === 'low'
-            ? 'low'
-            : v.tts?.cloud?.latency === 'balanced'
-              ? 'balanced'
-              : FISH_TTS_DEFAULTS.latency,
-          // Extra openai-compatible body fields (issue #1317). Rows are text
-          // pairs on the wire too — the controller coerces them to JSON types
-          // at send time, so the form never has to guess a value's shape.
-          compatParams: Array.isArray(v.tts?.cloud?.compatParams)
-            ? v.tts.cloud.compatParams.map(p => ({ key: String(p?.key ?? ''), value: String(p?.value ?? '') }))
-            : [],
-        },
-        remote: { url: v.tts?.remote?.url ?? '' },
-        // Per-engine voice level (dB), keyed by engine id — `pocket-tts` (hyphen).
-        gainDb: {
-          piper: 0,
-          kokoro: 0,
-          chatterbox: 0,
-          'pocket-tts': 0,
-          cloud: 0,
-          remote: 0,
-          ...(v.tts?.gainDb || {}),
-        },
-        // Per-engine speech speed (×), keyed by engine id — `pocket-tts` (hyphen).
-        speed: {
-          piper: 1,
-          kokoro: 1,
-          chatterbox: 1,
-          'pocket-tts': 1,
-          cloud: 1,
-          remote: 1,
-          ...(v.tts?.speed || {}),
-        },
-        corrections: (v.tts?.corrections || []).map(c => ({ from: c.from ?? '', to: c.to ?? '' })),
-      },
-      llm: {
-        provider: v.llm?.provider ?? 'ollama',
-        model: v.llm?.model ?? '',
-        ollamaUrl: v.llm?.ollamaUrl ?? '',
-        numCtx: typeof v.llm?.numCtx === 'number' ? v.llm.numCtx : 16384,
-        repeatPenalty: typeof v.llm?.repeatPenalty === 'number' ? v.llm.repeatPenalty : 1.15,
-        // Stored providerBaseUrls win; otherwise the legacy single baseUrl seeds
-        // the current provider's slot so no URL is lost.
-        providerBaseUrls: (() => {
-          const llmAny = v.llm as (Partial<LlmForm> & { baseUrl?: string; providerBaseUrls?: Record<string, string> }) | undefined;
-          const stored = llmAny?.providerBaseUrls;
-          if (stored && typeof stored === 'object') return { ...stored };
-          const legacy = llmAny?.baseUrl ?? '';
-          const prov = llmAny?.provider ?? 'ollama';
-          return legacy ? { [prov]: legacy } : {};
-        })(),
-        reasoning: !!v.llm?.reasoning,
-        toolChoice: v.llm?.toolChoice === 'auto' ? 'auto' : 'required',
-        pickerAgent: !!v.llm?.pickerAgent,
-        // Fallback must track the controller's default (config.ts, 250): a
-        // settings.json written before the field existed omits the key, and
-        // seeding the OLD default here means opening Settings and saving any
-        // LLM field silently persists it over the new one.
-        noRepeatWindow: String(typeof v.llm?.noRepeatWindow === 'number' ? v.llm.noRepeatWindow : 250),
-        artistVarietyWindow: String(typeof v.llm?.artistVarietyWindow === 'number' ? v.llm.artistVarietyWindow : 5),
-        requestWebResolve: !!v.llm?.requestWebResolve,
-        agentTimeoutMs: typeof v.llm?.agentTimeoutMs === 'number' ? v.llm.agentTimeoutMs : 45000,
-        pauseWhenEmpty: !!v.llm?.pauseWhenEmpty,
-        dailyTokenCap: typeof v.llm?.dailyTokenCap === 'number' ? v.llm.dailyTokenCap : 0,
-        budgetSoftPct: typeof v.llm?.budgetSoftPct === 'number' ? v.llm.budgetSoftPct : 80,
-        exemptRequests: v.llm?.exemptRequests !== false,
-        maxOutputTokens: typeof v.llm?.maxOutputTokens === 'number' ? v.llm.maxOutputTokens : 0,
-        discoverySteps: typeof v.llm?.discoverySteps === 'number' ? v.llm.discoverySteps : 0,
-        fallback: {
-          enabled: !!v.llm?.fallback?.enabled,
-          provider: v.llm?.fallback?.provider ?? 'ollama',
-          model: v.llm?.fallback?.model ?? '',
-          ollamaUrl: v.llm?.fallback?.ollamaUrl ?? '',
-          numCtx: typeof v.llm?.fallback?.numCtx === 'number' ? v.llm.fallback.numCtx : 16384,
-          repeatPenalty: typeof v.llm?.fallback?.repeatPenalty === 'number' ? v.llm.fallback.repeatPenalty : 1.15,
-          discoverySteps: typeof v.llm?.fallback?.discoverySteps === 'number' ? v.llm.fallback.discoverySteps : 0,
-          providerBaseUrls: (() => {
-            const fbAny = v.llm?.fallback as (LlmFallbackForm & { baseUrl?: string; providerBaseUrls?: Record<string, string> }) | undefined;
-            const stored = fbAny?.providerBaseUrls;
-            if (stored && typeof stored === 'object') return { ...stored };
-            const legacy = fbAny?.baseUrl ?? '';
-            const prov = fbAny?.provider ?? 'ollama';
-            return legacy ? { [prov]: legacy } : {};
-          })(),
-          reasoning: !!v.llm?.fallback?.reasoning,
-        },
-      },
-      search: {
-        provider: v.search?.provider ?? 'duckduckgo',
-        // GET /settings returns the apiKey redacted to 'set' | '' — that
-        // round-trips through POST harmlessly (settings.update ignores 'set').
-        apiKey: v.search?.apiKey ?? '',
-        baseUrl: v.search?.baseUrl ?? '',
-      },
-      embedding: {
-        enabled: v.embedding?.enabled ?? true,
-        provider: v.embedding?.provider ?? '',
-        model: v.embedding?.model ?? '',
-        providerBaseUrls: (() => {
-          const stored = (v.embedding as { providerBaseUrls?: Record<string, string> })?.providerBaseUrls;
-          if (stored && typeof stored === 'object') return { ...stored };
-          // Legacy migration keys by the EFFECTIVE provider (own, else the chat
-          // provider), the same key LibrarySection reads and writes.
-          const legacy = v.embedding?.baseUrl ?? '';
-          const prov = v.embedding?.provider || v.llm?.provider || '';
-          return legacy && prov ? { [prov]: legacy } : {};
-        })(),
-        ollamaUrl: v.embedding?.ollamaUrl ?? '',
-        seedCount: String(v.embedding?.seedCount ?? 0),
-        knnNeighbours: String(v.embedding?.knnNeighbours ?? 10),
-        moodVoteThreshold: String(v.embedding?.moodVoteThreshold ?? 0.4),
-        confidenceThreshold: String(v.embedding?.confidenceThreshold ?? 0.35),
-        maxActiveLearningRounds: String(v.embedding?.maxActiveLearningRounds ?? 3),
-        audioFusionWeight: String(v.embedding?.audioFusionWeight ?? 0.5),
-        batchSize: String(v.embedding?.batchSize ?? 25),
-        enrichment: {
-          lastfmTags: v.embedding?.enrichment?.lastfmTags ?? false,
-          lyrics: v.embedding?.enrichment?.lyrics ?? true,
-        },
-      },
-      scrobble: {
-        lastfm: {
-          enabled: !!v.scrobble?.lastfm?.enabled,
-          // 'set' sentinel from getRedacted() — round-trips harmlessly.
-          apiKey: v.scrobble?.lastfm?.apiKey ?? '',
-          apiSecret: v.scrobble?.lastfm?.apiSecret ?? '',
-          sessionKey: v.scrobble?.lastfm?.sessionKey ?? '',
-          username: v.scrobble?.lastfm?.username ?? '',
-        },
-        listenbrainz: {
-          enabled: !!v.scrobble?.listenbrainz?.enabled,
-          userToken: v.scrobble?.listenbrainz?.userToken ?? '',
-          username: v.scrobble?.listenbrainz?.username ?? '',
-          baseUrl: v.scrobble?.listenbrainz?.baseUrl ?? '',
-        },
-      },
-      likes: {
-        enabled: v.likes?.enabled ?? true,
-        starInNavidrome: v.likes?.starInNavidrome ?? true,
-        influenceDj: !!v.likes?.influenceDj,
-        maxTracks: String(v.likes?.maxTracks ?? 10),
-        windowDays: String(v.likes?.windowDays ?? 30),
-      },
-    };
+    const nextForm = settingsForm(data.values);
     const revision = settingsQuery.dataUpdatedAt;
     if (revision && appliedRevisionRef.current !== revision) {
       pendingFormRevisionRef.current = { revision, form: nextForm };
     }
     const pending = pendingFormRevisionRef.current;
     if (!pending) return;
+    let displayed = form;
+    if (displayed && formBaselineRef.current && pendingCloudSave
+      && cloudSaveReadReady(pendingCloudSave, revision)) {
+      const reconciled = reconcileSavedCloud(
+        formBaselineRef.current, displayed, pendingCloudSave.snapshot, nextForm.tts.cloud,
+      );
+      displayed = reconciled.form;
+      formBaselineRef.current = reconciled.baseline;
+      setPendingCloudSave(null);
+    }
+    // The swap wrote llm/embedding on the server. Adopt them now even when
+    // another section's unsaved edit is holding this revision back: left
+    // stale, the LLM page would show the pre-swap legs and the next save of
+    // either section would post them straight back over the swap.
+    if (displayed && formBaselineRef.current && pendingSwapRead
+      && committedReadReady(pendingSwapRead, revision)) {
+      const adopted = adoptServerPaths(formBaselineRef.current, displayed, nextForm, LLM_SWAP_FORM_KEYS);
+      displayed = adopted.form;
+      formBaselineRef.current = adopted.baseline;
+      setPendingSwapRead(null);
+    }
     const baseline = formBaselineRef.current;
-    const clean = !form || !baseline || sameForm(form, baseline);
-    if (!clean) return;
+    const clean = !displayed || !baseline || sameForm(displayed, baseline);
+    if (!clean) {
+      if (displayed !== form) setForm(displayed);
+      return;
+    }
+    // Compare against the rendered form: reconciliation may have restored
+    // omitted fields only in `displayed`, even when the GET was unchanged.
     if (!form || !sameForm(form, pending.form)) setForm(pending.form);
     formBaselineRef.current = pending.form;
     appliedRevisionRef.current = pending.revision;
     pendingFormRevisionRef.current = null;
-  }, [data, form, settingsQuery.dataUpdatedAt]);
+  }, [data, form, settingsQuery.dataUpdatedAt, pendingCloudSave, pendingSwapRead]);
 
   const saveSettings: SaveSettings = async (patch) => {
+    const submitted = form;
+    const cloudSnapshot = submitted ? cloudSaveSnapshot(submitted, patch) : null;
     try {
       const j = await saveMutation.mutateAsync(patch);
       // The refetch may resolve while this local form is still dirty against
       // its old baseline. Mark only submitted fields clean: an edit in another
       // settings section must continue to hold the queued revision back.
-      if (form) {
+      if (submitted) {
         const baseline = formBaselineRef.current;
         formBaselineRef.current = baseline
-          ? rebaselineSavedPatch(baseline, form, patch)
-          : form;
+          ? rebaselineSavedPatch(baseline, submitted, patch)
+          : submitted;
+      }
+      if (cloudSnapshot) {
+        // Wake hydration even if the authoritative GET rendered before this
+        // continuation. After a failed GET, wait for a later successful poll.
+        setPendingCloudSave({
+          snapshot: cloudSnapshot, refreshedAt: j.refreshedAt, refreshAfter: Date.now(),
+        });
       }
       setFieldErrors((prev) => mergePatchErrors(prev, patch, undefined));
       if (j.requiresRestart) setPendingRestart(true);
@@ -581,6 +262,29 @@ export default function SettingsPanel() {
         : undefined;
       setFieldErrors((prev) => mergePatchErrors(prev, patch, body?.fieldErrors));
       notify.err(errorMessage(e));
+      return false;
+    }
+  };
+
+  /**
+   * "Swap with primary". The controller builds and saves the swap, so there is
+   * no submitted patch to re-baseline: the swapped keys are adopted from the
+   * authoritative read instead (pendingSwapRead, applied in the hydration
+   * effect, or by a later poll if that read failed).
+   */
+  const swapLlmLegs = async (): Promise<boolean> => {
+    try {
+      const j = await swapMutation.mutateAsync();
+      setPendingSwapRead({ refreshedAt: j.refreshedAt, refreshAfter: Date.now() });
+      if (j.requiresRestart) setPendingRestart(true);
+      if (j.refreshError) notify.err(`swapped, but refresh failed: ${j.refreshError}`);
+      else notify.ok('swapped: the backup is now the primary');
+      if (j.keyNotPinned) {
+        notify.err('swapped, but the Library tagger could not keep the primary’s API key (too long to store): if embeddings stop working, set an embedding key in Library tagger');
+      }
+      return true;
+    } catch (e) {
+      notify.err(`swap failed: ${errorMessage(e)}`);
       return false;
     }
   };
@@ -626,12 +330,12 @@ export default function SettingsPanel() {
 
   /**
    * Post a whole-block patch — unless a number box in it was left blank, in
-   * which case name the box and save nothing. See `numberFields`.
+   * which case name the box and save nothing. See `save-payload.ts`.
    */
-  const saveBlock = (n: ReturnType<typeof numberFields>, patch: Record<string, unknown>) => {
-    const blanks = Object.keys(n.bad);
+  const saveBlock = ({ patch, fieldErrors }: ReturnType<typeof dangerSavePayload> | ReturnType<typeof archivesSavePayload>) => {
+    const blanks = Object.keys(fieldErrors);
     if (blanks.length > 0) {
-      setFieldErrors(prev => mergePatchErrors(prev, patch, n.bad));
+      setFieldErrors(prev => mergePatchErrors(prev, patch, fieldErrors));
       notify.err(blanks.length === 1
         ? 'a number field is empty — fill it in before saving'
         : `${blanks.length} number fields are empty — fill them in before saving`);
@@ -641,7 +345,7 @@ export default function SettingsPanel() {
   };
 
   /**
-   * Archives and the danger zone used to carry a Save button per card — one for
+   * Archives and Broadcast & mixer used to carry a Save button per card — one for
    * the bitrate, one for the retention window, one for each stream mount. Each
    * now folds into the section's one save.
    *
@@ -652,54 +356,11 @@ export default function SettingsPanel() {
    * is a blank number box, which is why both go through `saveBlock`.
    */
   const saveArchives = () => {
-    if (!form) return;
-    const n = numberFields();
-    saveBlock(n, {
-      archive: {
-        enabled: form.archive.enabled,
-        bitrate: n.int('archive.bitrate', form.archive.bitrate),
-        retentionDays: n.int('archive.retentionDays', form.archive.retentionDays),
-      },
-    });
+    if (form) saveBlock(archivesSavePayload(form));
   };
 
-  const saveDanger = () => {
-    if (!form) return;
-    const n = numberFields();
-    saveBlock(n, {
-      crossfadeDuration: n.float('crossfadeDuration', form.crossfadeDuration),
-      maxTrackSeconds: n.int('maxTrackSeconds', form.maxTrackSeconds),
-      silenceTrim: {
-        enabled: form.silenceTrim.enabled,
-        minGapMs: n.int('silenceTrim.minGapMs', form.silenceTrim.minGapMs),
-      },
-      transitions: {
-        pairDrain: form.transitions.pairDrain,
-        stemBlends: form.transitions.stemBlends,
-      },
-      audio: {
-        stemCache: form.transitions.stemCache,
-        stemCacheGb: n.num('audio.stemCacheGb', form.transitions.stemCacheGb),
-      },
-      loudness: {
-        targetLufs: n.float('loudness.targetLufs', form.loudness.targetLufs),
-        maxBoostDb: n.float('loudness.maxBoostDb', form.loudness.maxBoostDb),
-        source: form.loudness.source,
-      },
-      stream: {
-        idleWhenEmpty: form.stream.idleWhenEmpty,
-        idleAfterMinutes: n.int('stream.idleAfterMinutes', form.stream.idleAfterMinutes),
-        opusEnabled: form.stream.opusEnabled,
-        opusBitrate: n.int('stream.opusBitrate', form.stream.opusBitrate),
-        flacEnabled: form.stream.flacEnabled,
-        oggIcyMetadata: form.stream.oggIcyMetadata,
-        aacEnabled: form.stream.aacEnabled,
-        aacBitrate: n.int('stream.aacBitrate', form.stream.aacBitrate),
-        bitrate: n.int('stream.bitrate', form.stream.bitrate),
-        bufferSeconds: n.num('stream.bufferSeconds', form.stream.bufferSeconds),
-        maxListeners: n.int('stream.maxListeners', form.stream.maxListeners),
-      },
-    });
+  const saveBroadcast = () => {
+    if (form) saveBlock(dangerSavePayload(form));
   };
 
   const activeSpec = sectionById(activeSection);
@@ -728,12 +389,7 @@ export default function SettingsPanel() {
   /** Roll this section's fields back to the last saved baseline, nothing else. */
   const discardSection = () => {
     if (!form || !baseline || !activeSpec) return;
-    const next = JSON.parse(JSON.stringify(form)) as Record<string, unknown>;
-    const from = baseline as unknown as Record<string, unknown>;
-    for (const key of activeSpec.formKeys) {
-      if (key in from) next[key] = JSON.parse(JSON.stringify(from[key] ?? null));
-    }
-    setForm(next as unknown as FormState);
+    setForm(restorePaths(form, baseline, activeSpec.formKeys));
     // The errors belonged to values that no longer exist — same ownership rule
     // the save path uses, so an unrelated section's message survives.
     setFieldErrors(prev => {
@@ -747,6 +403,7 @@ export default function SettingsPanel() {
 
   /** Search result → switch section, open Advanced if needed, scroll and flash. */
   const jumpTo = useCallback(({ section, anchor, advanced }: SettingsJump) => {
+    if (!sections.some(s => s.id === section)) return;
     setActiveSection(section);
     if (advanced) setAdvOpen(prev => ({ ...prev, [section]: true }));
     // The section swap and the disclosure both have to commit before the target
@@ -766,7 +423,7 @@ export default function SettingsPanel() {
       window.setTimeout(() => el.removeAttribute('data-flash'), 2600);
     };
     window.requestAnimationFrame(settle);
-  }, []);
+  }, [sections]);
 
   const chrome = useMemo(() => ({
     saveSlot,
@@ -777,12 +434,12 @@ export default function SettingsPanel() {
   }), [saveSlot, reportDirty, advOpen, activeSection]);
 
   return (
-    <div className="stack-mobile grid grid-cols-[240px_1fr] items-start gap-6">
-      <aside className="grid gap-3.5 sm:sticky sm:top-6">
+    <div className="grid min-w-0 grid-cols-1 items-start gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+      <aside className="grid min-w-0 gap-3.5 lg:sticky lg:top-6">
         {SECTION_GROUPS.map(group => (
           <div key={group} className="grid gap-1">
             <span className="caption pb-1">{group}</span>
-            {SECTIONS.filter(s => s.group === group).map(s => {
+            {sections.filter(s => s.group === group).map(s => {
               const isActive = activeSection === s.id;
               const Icon = s.icon;
               // A section not on screen can only be dirty in form paths — its
@@ -823,8 +480,8 @@ export default function SettingsPanel() {
         ))}
       </aside>
 
-      <div className="grid gap-4">
-        <SettingsSearch onJump={jumpTo} />
+      <div className="grid min-w-0 grid-cols-1 gap-4">
+        <SettingsSearch onJump={jumpTo} sections={sections} />
         {err && <ErrorState error={err} onRetry={refresh} />}
         {pendingRestart && (
           <div
@@ -850,15 +507,6 @@ export default function SettingsPanel() {
         )}
         {!data && !err && <SkeletonForm fields={5} />}
 
-        {/* One save bar per section, sticky, and only while something is
-            unsaved. Each section's own SaveBar portals its note + button into
-            the slot below, so the wording, the patch and the error scoping
-            still belong to the section that knows them.
-
-            top-[3.25rem] clears AdminShell's own sticky header (top-0, ~49px
-            tall) rather than tucking under it like the section rail does — this
-            is the one strip that has to stay readable while the operator
-            scrolls a long section looking for what they changed. */}
         {sectionDirty && (
           <div className="sticky top-[3.25rem] z-30 grid gap-2.5 border border-vermilion bg-bg p-3 shadow-drawer">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -885,8 +533,26 @@ export default function SettingsPanel() {
             setForm(prev => (prev ? updater(prev) : prev));
           return (
           <>
+            {activeSection === 'selection' && (
+              <MusicSelectionSection
+                data={data} form={form} setForm={updateForm} busy={busy}
+                saveSettings={saveSettings} fieldErrors={fieldErrors}
+              />
+            )}
             {activeSection === 'tts' && data.tts && (
               <TtsSection
+                data={data} form={form} setForm={updateForm} busy={busy}
+                saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
+              />
+            )}
+            {activeSection === 'behaviour' && (
+              <DjBehaviourSection
+                data={data} form={form} setForm={updateForm} busy={busy}
+                saveSettings={saveSettings} fieldErrors={fieldErrors}
+              />
+            )}
+            {djBrainEnabled && activeSection === 'brain' && (
+              <BrainSection
                 data={data} form={form} setForm={updateForm} busy={busy}
                 saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
               />
@@ -895,6 +561,7 @@ export default function SettingsPanel() {
               <LlmSection
                 data={data} form={form} setForm={updateForm} busy={busy}
                 saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
+                unsavedChanges={unsavedAnywhere(form, baseline, hasLocalDirty)} swapLegs={swapLlmLegs}
               />
             )}
             {activeSection === 'search' && (
@@ -924,23 +591,15 @@ export default function SettingsPanel() {
                 adminFetch={adminFetch}
               />
             )}
-            {activeSection === 'scrobble' && (
-              <ScrobbleSection
+            {activeSection === 'listeners' && (
+              <ListenersSection
                 data={data} form={form} setForm={updateForm} busy={busy}
                 saveSettings={saveSettings} fieldErrors={fieldErrors} adminFetch={adminFetch} refresh={refresh}
-              />
-            )}
-            {activeSection === 'likes' && (
-              <LikesSection
-                data={data} form={form} setForm={updateForm} busy={busy}
-                saveSettings={saveSettings} fieldErrors={fieldErrors}
               />
             )}
           </>
           );
         })()}
-        {/* Self-contained panels — each re-calls useAdminAuth and owns its
-            own data fetch, so they render outside the data && form guard. */}
         {activeSection === 'archives' && (
           <>
             <ArchivesPanel />
@@ -1049,12 +708,12 @@ export default function SettingsPanel() {
           </>
         )}
         {activeSection === 'backup' && <BackupPanel />}
-        {activeSection === 'danger' && (
+        {activeSection === 'broadcast' && (
           <>
             <SectionHeader
-              eyebrow="danger zone"
-              title="Crossfade, stream control, and mixer restart."
-              sub="Crossfade is grouped here because it needs a mixer restart to apply. Stream stop and mixer restart both affect every current listener."
+              eyebrow="broadcast & mixer"
+              title="How the station sounds on every stream."
+              sub="Crossfade, ducking, transitions, levelling and the stream mounts. Most are read by the mixer at startup, so the save bar warns before a change that needs a restart. Stopping the stream and restarting the mixer affect every current listener and ask before they run."
               metrics={[
                 {
                   n: data?.streamOnAir == null ? '—' : data.streamOnAir ? 'on air' : 'off air',
@@ -1086,8 +745,6 @@ export default function SettingsPanel() {
               <Card title="Idle pause" sub="silence the programme when nobody is listening">
                 <div className="field">
                   <Label>Pause when the room is empty</Label>
-                  {/* Seg + "after" + minutes + "min" + Save is wider than a
-                      phone card, so the row wraps below 640px. */}
                   <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                     <Seg
                       options={[
@@ -1131,7 +788,7 @@ export default function SettingsPanel() {
               </Card>
             )}
 
-            <Advanced note="crossfade, transitions, loudness and the extra stream mounts">
+            <Advanced note="crossfade, duck depth, transitions, loudness and the extra stream mounts">
             {form && (
               <Card title="Crossfade" sub="track transition overlap">
                 <div className="field">
@@ -1157,6 +814,70 @@ export default function SettingsPanel() {
                   <div className="field-hint">
                     Seconds of overlap between tracks (current: {data?.values?.crossfadeDuration}s).
                     Saving flags a pending restart. Apply it with the Mixer card below.
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            {form && (
+              <Card title="Duck depth" sub="how far the music drops under the DJ">
+                <div className="grid gap-3">
+                  <div className="field">
+                    <div className="flex items-center gap-2">
+                      <Label>DJ over silence</Label>
+                      <Pill tone="ink">restart required</Pill>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        className="mono-num w-28"
+                        aria-label="Duck depth for solo DJ speech"
+                        type="number"
+                        step={0.01}
+                        min={0}
+                        max={1}
+                        value={form.ducking.voice}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                          setForm(f => (f ? { ...f, ducking: { ...f.ducking, voice: e.target.value } } : f))
+                        }
+                      />
+                      <span className="text-[12px] text-muted">× music</span>
+                    </div>
+                    <SettingsFieldError path="ducking.voice" errors={fieldErrors} />
+                    <div className="field-hint">
+                      The heavy duck: station IDs, the hourly time, weather and request intros
+                      (current: {data?.values?.ducking?.voice}). It is the fraction of the music
+                      LEFT UP, so smaller is deeper — 0.22 is about −13 dB, 1 is no duck at all
+                      and 0 mutes the music while the DJ talks. Saving flags a pending restart;
+                      apply it with the Mixer card below.
+                    </div>
+                  </div>
+
+                  <div className="field">
+                    <div className="flex items-center gap-2">
+                      <Label>DJ over a track</Label>
+                      <Pill tone="ink">restart required</Pill>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        className="mono-num w-28"
+                        aria-label="Duck depth for talk-over links"
+                        type="number"
+                        step={0.01}
+                        min={0}
+                        max={1}
+                        value={form.ducking.intro}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                          setForm(f => (f ? { ...f, ducking: { ...f.ducking, intro: e.target.value } } : f))
+                        }
+                      />
+                      <span className="text-[12px] text-muted">× music</span>
+                    </div>
+                    <SettingsFieldError path="ducking.intro" errors={fieldErrors} />
+                    <div className="field-hint">
+                      The light duck for between-track links, which talk over the song rather
+                      than replacing it (current: {data?.values?.ducking?.intro}). Keep it above
+                      the heavy duck — 0.30 is about −10 dB. Saving flags a pending restart.
+                    </div>
                   </div>
                 </div>
               </Card>
@@ -1234,8 +955,7 @@ export default function SettingsPanel() {
                       />
                       <span className="text-sm opacity-70">
                         GB &middot; holds ~
-                        {/* /25 mirrors the controller's stem-cache APPROX_TRACK_BYTES
-                            ceiling, /13 the field-measured average (#1257). */}
+                        {/* Track counts use the controller's 25 MB ceiling and the measured 13 MB average. */}
                         {Math.floor(
                           ((Number(form.transitions.stemCacheGb) || 15) * 1024) / 25,
                         ).toLocaleString('en-GB')}
@@ -1284,7 +1004,63 @@ export default function SettingsPanel() {
             )}
 
             {form && (
-              <Card title="Max track length" sub="cut over-length tracks on air">
+              <Card title="DJ transition effects" sub="which gestures the DJ may reach for">
+                <div className="field-hint">
+                  Only ever heard when the on-air persona is in DJ mode — this switches off
+                  individual gestures without giving up the rest of the kit. The station still
+                  validates every choice against the audio analysis, so switching one on is
+                  permission, not a guarantee. Applies live; no restart.
+                </div>
+                <div className="grid gap-3">
+                  {TRANSITION_EFFECT_FIELDS.map(({ id, label, hint }) => {
+                    const aria = fieldAria(`transition-effect-${id}`, undefined, { hasDescription: true });
+                    return (
+                      <div className="field" key={id}>
+                        <Label {...aria.labelledByProps}>{label}</Label>
+                        <div className="flex items-center gap-2">
+                          <Seg
+                            {...aria.groupProps}
+                            options={[
+                              { id: 'on', label: 'On' },
+                              { id: 'off', label: 'Off' },
+                            ]}
+                            value={form.transitions.effects[id] ? 'on' : 'off'}
+                            onChange={v =>
+                              setForm(f =>
+                                f
+                                  ? {
+                                    ...f,
+                                    transitions: {
+                                      ...f.transitions,
+                                      effects: { ...f.transitions.effects, [id]: v === 'on' },
+                                    },
+                                  }
+                                  : f,
+                              )
+                            }
+                          />
+                        </div>
+                        <div {...aria.descriptionProps} className="field-hint">{hint}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Card>
+            )}
+
+            {form && (
+              <Card title="Max track length" sub={form.maxTrackLengthMode === 'exclude' ? 'exclude known over-length automatic tracks' : 'cut over-length tracks on air'}>
+                <div className="field">
+                  <Label {...lengthModeAria.labelProps}>Maximum length behavior</Label>
+                  <Select value={form.maxTrackLengthMode} onValueChange={v => setForm(f => f ? { ...f, maxTrackLengthMode: v as 'cut' | 'exclude' } : f)}>
+                    <SelectTrigger {...lengthModeAria.controlProps}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="cut">Cut on air (legacy)</SelectItem>
+                      <SelectItem value="exclude">Exclude longer automatic tracks</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <SettingsFieldError path="maxTrackLengthMode" errors={fieldErrors} id={lengthModeAria.errorProps.id} />
+                </div>
                 <div className="field">
                   <Label>Maximum track length</Label>
                   <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
@@ -1306,11 +1082,58 @@ export default function SettingsPanel() {
                   </div>
                   <SettingsFieldError path="maxTrackSeconds" errors={fieldErrors} />
                   <div className="field-hint">
-                    The DJ won&rsquo;t auto-pick tracks longer than this, handy for hour-long
-                    album mixes or DJ sets that keep landing in rotation. Listener requests still
-                    play any length, and a show can override this with its own limit (0 there means
-                    unlimited). Applies on the next pick; no restart needed.
+                    {form.maxTrackLengthMode === 'exclude'
+                      ? 'Automatic picks and fallback playlists exclude tracks with known duration above the limit. Tracks exactly at the limit are allowed. Tracks with unknown durations remain eligible and play without this cutoff. A library of only longer tracks can leave no eligible music.'
+                      : 'Long tracks remain eligible for automatic picks and fade out at this limit on air.'}
+                    {' '}Listener requests and explicit studio choices are exempt. Shows inherit this
+                    station behavior and can override the limit (0 means unlimited). Changes apply to
+                    future automatic tracks without a restart. Already handed-off playback keeps its
+                    previous policy. Silence trimming and show-boundary fades still apply.
                   </div>
+                </div>
+              </Card>
+            )}
+
+            {form && (
+              <Card title="Show boundaries" sub="stop a long track spilling into the next show">
+                <div className="field">
+                  <Label>Fade out at a show change</Label>
+                  <div className="flex items-center gap-2">
+                    <Seg
+                      options={[
+                        { id: 'on', label: 'On' },
+                        { id: 'off', label: 'Off' },
+                      ]}
+                      value={form.fadeAtShowEnd ? 'on' : 'off'}
+                      onChange={id => setForm(f => (f ? { ...f, fadeAtShowEnd: id === 'on' } : f))}
+                    />
+                  </div>
+                  <SettingsFieldError path="fadeAtShowEnd" errors={fieldErrors} />
+                  <div className="field-hint">
+                    On a schedule built from long records — ambient, classical, prog — the last
+                    track of a show can still be playing well into the next one, so the incoming
+                    host talks over the outgoing show&rsquo;s music. With this on, a track that
+                    would run past the boundary is faded out there instead. A short overrun is
+                    left alone, a track is never cut down to a stub, and listener requests always
+                    play in full. Each show can override this. Applies on the next pick; no
+                    restart needed.
+                  </div>
+                  {(() => {
+                    // The minimum play time plus overrun tolerance prevents boundary
+                    // cuts at this cap. Shows can override the station cap.
+                    const floor = data?.values?.boundaryFadeMinTrackSeconds ?? 150;
+                    const cap = Number(form.maxTrackSeconds);
+                    if (form.maxTrackLengthMode !== 'cut' || !form.fadeAtShowEnd || !Number.isFinite(cap) || cap <= 0 || cap > floor) return null;
+                    return (
+                      <div className="field-hint italic">
+                        With <b>Maximum track length</b> at {cap}s, boundary fading cannot apply
+                        to tracks using this cap: it requires more than {floor}s of playable
+                        music. The cap limits track length, but a track starting near the end
+                        of a show can still run into the next one. Shows that override this
+                        cap may still use boundary fading.
+                      </div>
+                    );
+                  })()}
                 </div>
               </Card>
             )}
@@ -1460,9 +1283,10 @@ export default function SettingsPanel() {
                       Cap on how far a quiet track is turned up (0 = level down only). Boost is
                       also limited by each track&rsquo;s own measured peak headroom, so raising
                       this won&rsquo;t distort dynamic material; very quiet, dynamic masters
-                      simply can&rsquo;t reach the target cleanly. Loud tracks are turned down as
-                      far as needed. Applies from the next queued track; no restart, tracks need
-                      acoustic analysis (Library → Analyze).
+                      simply can&rsquo;t reach the target cleanly. A track whose peak is unknown
+                      is not turned up at all. Loud tracks are turned down as far as needed.
+                      Applies from the next queued track; no restart, tracks need acoustic
+                      analysis (Library → Analyze).
                     </div>
                   </div>
                 </div>
@@ -1575,18 +1399,19 @@ export default function SettingsPanel() {
                     (FLAC/ALAC/WAV); for a lossy-source library (e.g. AAC/MP3) it faithfully
                     carries lossy audio and adds no fidelity over MP3/Opus. Meant for external
                     players (VLC, foobar2000, a network streamer); the web and mobile players
-                    stay on MP3/Opus and won&apos;t auto-select it. The mandatory{' '}
-                    <code>/stream.mp3</code> mount always serves everyone.
+                    stay on MP3/Opus and won&apos;t auto-select it. Changing title, artist, and
+                    album metadata is carried automatically as native chained Ogg tags. The
+                    mandatory <code>/stream.mp3</code> mount always serves everyone.
                   </div>
                 </div>
               </Card>
             )}
 
             {form && (
-              <Card title="Ogg metadata" sub="ICY titles on /stream.opus + /stream.flac">
+              <Card title="Ogg metadata" sub="Opus ICY compatibility; FLAC tags are automatic">
                 <div className="field">
                   <div className="flex items-center gap-2">
-                    <Label>Push ICY track titles on the Ogg mounts</Label>
+                    <Label>Push ICY track titles on the Opus mount</Label>
                     <Pill tone="ink">restart required</Pill>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1605,13 +1430,12 @@ export default function SettingsPanel() {
                   </div>
                   <SettingsFieldError path="stream.oggIcyMetadata" errors={fieldErrors} />
                   <div className="field-hint">
-                    On by default. Sends each track&apos;s title out-of-band (ICY) on the Opus and
-                    FLAC mounts, which most internet-radio players and Cast receivers need: they
-                    read the in-band Ogg tags only once, at connect, and otherwise stay stuck on
-                    the first title. Turn it <strong>off</strong> if your listeners use
-                    foobar2000: it reads the in-band tags correctly, and the extra ICY channel
-                    breaks its FLAC metadata display. The MP3 and AAC mounts always use ICY and
-                    are unaffected either way.
+                    On by default for legacy Opus compatibility. This controls out-of-band ICY
+                    updates on <code>/stream.opus</code> only. <code>/stream.flac</code> always
+                    carries changing title, artist, and album metadata as native chained Ogg tags;
+                    a missing <code>Icy-MetaInt</code> response header there is expected. Receiver
+                    support varies, and this setting does not embed or guarantee artwork. MP3 and
+                    AAC behavior is unaffected.
                   </div>
                 </div>
               </Card>
@@ -1811,6 +1635,60 @@ export default function SettingsPanel() {
               </Card>
             )}
 
+            {form && (
+              <Card title="Listener country" sub="where the Stats rollup gets geography from">
+                <div className="field">
+                  <Label>Country header</Label>
+                  <Input
+                    className="w-full"
+                    aria-label="Proxy header carrying the listener country"
+                    placeholder="x-country-code"
+                    value={form.stream.countryHeader}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f =>
+                        f
+                          ? { ...f, stream: { ...f.stream, countryHeader: e.target.value } }
+                          : f,
+                      )
+                    }
+                  />
+                  <SettingsFieldError path="stream.countryHeader" errors={fieldErrors} />
+                  <div className="field-hint">
+                    Stats reads <code>CF-IPCountry</code> first, which only Cloudflare sets.
+                    If your own proxy adds a country header, name it here and it is read
+                    when Cloudflare&apos;s is absent. Leave blank if you have neither —
+                    an unknown country is simply left out of the rollup.
+                  </div>
+                </div>
+                <div className="field">
+                  <Label>GeoIP database</Label>
+                  <Input
+                    className="w-full"
+                    aria-label="Path to an offline GeoIP database"
+                    placeholder="/var/sub-wave/geoip/GeoLite2-Country.mmdb"
+                    value={form.stream.geoipDbPath}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setForm(f =>
+                        f
+                          ? { ...f, stream: { ...f.stream, geoipDbPath: e.target.value } }
+                          : f,
+                      )
+                    }
+                  />
+                  <SettingsFieldError path="stream.geoipDbPath" errors={fieldErrors} />
+                  <div className="field-hint">
+                    Last resort when no header carries the answer: the path, inside the
+                    controller container, of a MaxMind-format <code>.mmdb</code> country
+                    database you supply — GeoLite2, DB-IP Lite and IP2Location LITE all
+                    work. Nothing is bundled; each has its own licence and attribution
+                    terms. An unreadable file is logged once and then ignored, so a wrong
+                    path costs the lookup, never a listener.{' '}
+                    <strong>GEOIP_DB_PATH</strong>{' '}in the environment overrides this.
+                  </div>
+                </div>
+              </Card>
+            )}
+
 
             </Advanced>
 
@@ -1833,10 +1711,10 @@ export default function SettingsPanel() {
             <SaveBar
               note="Crossfade, the encoder settings and the listener buffer only reach the stream after a mixer restart. Idle pause, loudness, dead-air trim and the track-length cap apply live."
               busy={busy}
-              onSave={saveDanger}
-              saveLabel="Save danger zone"
+              onSave={saveBroadcast}
+              saveLabel="Save broadcast & mixer"
               errors={fieldErrors}
-              ownedKeys={['crossfadeDuration', 'maxTrackSeconds', 'silenceTrim', 'transitions', 'audio', 'loudness', 'stream']}
+              ownedKeys={['crossfadeDuration', 'ducking', 'maxTrackSeconds', 'maxTrackLengthMode', 'fadeAtShowEnd', 'silenceTrim', 'transitions', 'audio', 'loudness', 'stream']}
             />
           </>
         )}

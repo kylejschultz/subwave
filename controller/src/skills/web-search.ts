@@ -1,28 +1,11 @@
-// Web search helper — backs the `searchArtistNews` segment tool (llm/
-// segment-tools.js). There is no standalone "web-search skill" object — the
-// segment-director agent (skills/_agent.js) decides when artist news airs.
-//
-// Four backends, chosen via settings.search.provider:
-//   - duckduckgo (default) — DuckDuckGo's Instant Answer API. Free, no key,
-//     officially documented. Returns useful results only for entity / definition
-//     queries; for most artist queries it returns nothing, which the segment
-//     director already treats as a valid (silent) outcome.
-//   - tavily — paid API for richer web results. Reads its key from
-//     settings.search.apiKey, falling back to config.search.apiKey
-//     (SEARCH_API_KEY env var) for back-compat with earlier installs.
-//   - brave — Brave Search API. Real web results for artist-name queries
-//     (issue #623). Same key resolution as Tavily; metered billing with $5/mo
-//     of free credits (~1,000 queries), so the 30-min memo matters here too.
-//   - searxng — self-hosted meta-search, keyless, needs settings.search.baseUrl.
-//
-// All backends return the same shape — { answer, results: [{ title, content }] }
-// — so callers don't have to branch. searchWeb() wraps every call in a 30-min
-// memo to keep the homelab polite under DDG's unofficial fair-use limits and
-// to avoid burning Tavily/Brave credits on duplicate ticks.
+// All providers return { answer, results: [{ title, content }] } behind a 30-minute memo.
+// DDG instant answers may be empty; Tavily/Brave need keys; SearXNG needs a base URL.
+// Brave supports artist-name queries (#623); searxngEngines pins only these calls (#1353).
 
 import { config } from '../config.js';
 import * as settings from '../settings.js';
 import { fetchWithTimeout } from '../util/fetch-timeout.js';
+import { BoundedKeyMap } from '../util/bounded-key-map.js';
 
 const TAVILY_ENDPOINT = 'https://api.tavily.com/search';
 const DDG_ENDPOINT = 'https://api.duckduckgo.com/';
@@ -31,11 +14,21 @@ const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 type SearchResult = { title: string; content: string };
 type SearchResponse = { answer: string; results: SearchResult[] };
 
-// 30-min TTL cache keyed by `${provider}:${query}`. Same shape as music/picker.js
-// — Map + { val, at }, no LRU eviction (search queries are bounded by the
-// artists actually on rotation, so the Map stays small).
+// 30-min TTL cache keyed by `${provider}:${query}`. BOUNDED: the request path's
+// identifyRequestedTrack searches on a listener's free-text description, so the
+// key space is open-ended. Expired entries go first when the cap is reached, then
+// the least recently written.
 const CACHE_TTL_MS = 30 * 60 * 1000;
-const cache = new Map<string, { val: SearchResponse; at: number }>();
+const CACHE_MAX_KEYS = 256;
+const cache = new BoundedKeyMap<{ val: SearchResponse; at: number }>({
+  maxKeys: CACHE_MAX_KEYS,
+  isLive: (rec, now) => now - rec.at < CACHE_TTL_MS,
+});
+
+// Test seam.
+export function searchCacheSize(): number {
+  return cache.size;
+}
 
 async function memo(
   key: string,
@@ -148,10 +141,12 @@ export async function searxngSearch(
   const baseUrl = (settings.get().search?.baseUrl || '').trim();
   if (!baseUrl) throw new Error('SearXNG baseUrl not configured');
 
-  const url = new URL('/search', baseUrl);
-  url.searchParams.set('q', query);
-  url.searchParams.set('format', 'json');
-  if (recency) url.searchParams.set('time_range', recency);
+  const url = buildSearxngUrl({
+    baseUrl,
+    query,
+    recency,
+    engines: settings.get().search?.searxngEngines || '',
+  });
 
   const res = await fetchWithTimeout(url, {
     headers: {
@@ -162,6 +157,29 @@ export async function searxngSearch(
   if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
   const data = await res.json();
   return parseSearxngResponse(data);
+}
+
+// Pure URL builder for a SearXNG query. Exported alongside parseSearxngResponse
+// so the query shape can be pinned without mocking fetch.
+//
+// `engines` is the optional operator pin (settings.search.searxngEngines, #1353):
+// a comma-separated list of SearXNG `name:` fields, sent as SearXNG's per-request
+// `engines=` param so one instance can serve a narrow, deterministic engine set
+// to the controller while browser traffic keeps the instance-wide defaults.
+// Empty means the param is omitted entirely — the pre-#1353 behaviour.
+export function buildSearxngUrl(opts: {
+  baseUrl: string;
+  query: string;
+  recency?: 'day' | 'week' | 'month';
+  engines?: string;
+}): URL {
+  const url = new URL('/search', opts.baseUrl);
+  url.searchParams.set('q', opts.query);
+  url.searchParams.set('format', 'json');
+  if (opts.recency) url.searchParams.set('time_range', opts.recency);
+  const engines = (opts.engines || '').trim();
+  if (engines) url.searchParams.set('engines', engines);
+  return url;
 }
 
 // Pure parser for SearXNG's JSON response. Maps the SearXNG shape

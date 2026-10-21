@@ -14,7 +14,7 @@ whole HTTP API (and a live playground), see [`api.md`](./api.md) or the admin
 
 ## The short version
 
-There are two ways to connect — both expose the **same nineteen tools** from
+There are two ways to connect — both expose the **same twenty tools** from
 the **same source** (`controller/src/mcp/`):
 
 ```
@@ -29,7 +29,7 @@ Local alternative — stdio (runs from a repo clone via tsx):
 The tools own no state and almost no logic of their own — each is a typed
 wrapper over one controller HTTP endpoint (the one exception:
 `subwave_request_song` polls the request receipt so the agent gets an outcome,
-not a ticket). The model gets nineteen tools; the controller does the real work
+not a ticket). The model gets twenty tools; the controller does the real work
 (LLM matching, track selection, TTS, queueing).
 
 **HTTP endpoint (recommended).** The controller serves MCP directly at
@@ -41,8 +41,10 @@ claude mcp add --transport http subwave https://your-station/api/mcp \
 ```
 
 Auth mirrors the REST API: read tools work unauthenticated; DJ-control tools
-need the station's admin credentials in the `Authorization` header. No clone, no
-build, no separate process.
+need the station's admin credentials in the `Authorization` header. A private
+station's `subwave_similar_tracks` takes its *listener* password in an
+`x-station-auth` header — a separate secret, forwarded the same way. No clone,
+no build, no separate process.
 
 It is the agent-facing twin of the listener request drawer: where a human types
 into the browser and hits `POST /request`, an agent calls `subwave_request_song`
@@ -68,14 +70,15 @@ intent-shaped tools.
 |---|---|---|---|
 | `subwave_health` | `GET /health` | none | no |
 | `subwave_now_playing` | `GET /now-playing` | none | no |
-| `subwave_station_state` | `GET /state` | none | no |
+| `subwave_station_state` | `GET /state` (+ `GET /debug/dj-log` with admin creds) | none (booth log: admin) | no |
 | `subwave_schedule` | `GET /schedule` | none | no |
 | `subwave_session` | `GET /session` | none | no |
 | `subwave_request_song` | `POST /request` + `GET /request/:id` | none | queues a track |
 | `subwave_request_status` | `GET /request/:id` | none | no |
 | `subwave_search_library` | `GET /dj/search` | admin | no |
+| `subwave_similar_tracks` | `GET /similar-tracks` | station | no |
 | `subwave_queue_track` | `POST /dj/queue-track` | admin | queues a track |
-| `subwave_skip_track` | `POST /dj/skip` | admin | ends the current track |
+| `subwave_skip_track` | `POST /dj/skip` | admin | ends the current track (optional `expectId`: only that track, else refused) |
 | `subwave_dj_announce` | `POST /dj/say` | admin | speaks now |
 | `subwave_dj_segment` | `POST /dj/segment` | admin | speaks now |
 | `subwave_list_skills` | `GET /dj/skills` | admin | no |
@@ -90,9 +93,13 @@ intent-shaped tools.
 
 All read-only passthroughs. `now-playing` returns the current track, station
 context (time, weather, dominant mood), and live listener counts; `state`
-returns the upcoming queue, recent history, and the DJ booth log; `schedule`
+returns the upcoming queue and recent history, plus the DJ booth log when the
+connection carries admin credentials (the log is operator diagnostics, so the
+public `GET /state` no longer serves it); `schedule`
 the personas, shows, and weekly grid (in the station's timezone); `session`
-the DJ's live session identity and recent transcript turns.
+the DJ's live session identity and recent transcript turns (for up to 30
+minutes after a show change these lead with the previous show's last few
+turns, flagged `meta.carried`, and a `kind: 'show-boundary'` separator).
 
 These exist so the agent can ground a request in what's actually on-air. A
 request like *"something slower than this"* is only meaningful if the model
@@ -132,6 +139,30 @@ mood tags), then queue an exact result by id. Admin-gated, no LLM, no rate
 limit, no DJ intro. This is the right pair when the agent already knows the
 exact track; `subwave_request_song` is for vibes and natural language.
 
+### `subwave_similar_tracks`
+
+The sound-alike lookup the admin Library panel runs, exposed to an API caller.
+It KNNs the CLAP audio embedding — timbre, instrumentation, production, energy,
+derived from the waveform — so it is blind to tags and works on instrumentals
+and non-English tracks where a text search does not. Seed it with a track id
+(`subwave_now_playing`'s `subsonic_id` is the obvious one) or free text that
+resolves to one.
+
+Two things separate it from the other read tools:
+
+- **It is station-gated, not admin-gated.** A public station serves it with no
+  credential at all; a private one wants the listener password. An operator's
+  call-in agent gets library reads without the admin console.
+- **A library with no audio analysis is not an error.** `results` comes back
+  empty with a `reason` — `no-audio-index` (the station has no CLAP vectors at
+  all, so it needs the heavy analyzer), `seed-not-analysed` (this track
+  specifically), `seed-not-found`, or `no-neighbours`. An agent can tell "ask
+  again after the analysis pass" from "your track id is wrong", which a bare
+  empty list or a 503 does not allow.
+
+Never-play tracks are filtered out on the way, at the library's own blocklist
+chokepoint.
+
 ### `subwave_dj_announce`
 
 Puts a spoken update on-air via `POST /dj/say`. Three axes:
@@ -139,7 +170,9 @@ Puts a spoken update on-air via `POST /dj/say`. Three axes:
 - **`mode`** — `styled` (default) hands the text to the LLM as an *instruction*
   and the DJ rewrites it in persona before speaking; `raw` speaks the text
   verbatim. Give a topic → `styled`. Give finished words → `raw` (also the
-  right choice for emergency wording that must not be paraphrased).
+  right choice for emergency wording that must not be paraphrased). A `raw`
+  line is booth-logged and shown in the session feed but never fed back into
+  the DJ's later prompts, so it cannot resurface as banter (#1908).
 - **`placement`** — `solo` (default) is a heavy-ducked solo DJ moment (maps to
   the controller's `dj-speak` kind → `say.txt`); `over-track` is lightly ducked
   so the DJ talks over the playing song (maps to `link` → `intro.txt`).
@@ -206,6 +239,11 @@ The controller splits its surface in two (see
 
 - **Public** — `/health`, `/now-playing`, `/state`, `/schedule`, `/session`,
   `/request` (rate-limited), `/request/:id`. No auth.
+- **Station-password gated** — `/similar-tracks`. Gated by the station's
+  *listener* password (Settings → Privacy), a different secret from the admin
+  one, and a different failure direction: open on a public station (no locks
+  on), closed on a private one. That is what lets an operator point a call-in
+  agent at their library without handing it the admin console.
 - **Admin, Basic-auth gated** — `/dj/*`, `/sfx` and `/jingles`. Gated by the controller's
   `ADMIN_USER` / `ADMIN_PASS`.
 
@@ -222,13 +260,17 @@ prompt.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SUBWAVE_API_URL` | `http://localhost:7701` | Controller base URL. Prod behind Caddy: `http://localhost:7700/api`. |
+| `SUBWAVE_API_URL` | auto-detected | Controller base URL. Unset: the first of `http://localhost:7701` (dev) and `http://localhost:7700/api` (prod behind Caddy) whose `/health` answers, else `:7701`. |
 | `SUBWAVE_ADMIN_USER` | — | Matches the controller's `ADMIN_USER`. |
 | `SUBWAVE_ADMIN_PASS` | — | Matches the controller's `ADMIN_PASS`. |
+| `SUBWAVE_STATION_PASSWORD` | — | Matches `settings.privacy.password`. Only needed for `subwave_similar_tracks` on a station with a privacy lock on. |
 
 In dev the controller is exposed directly on `:7701`. In prod only Caddy binds
 a host port, so the server must target `:7700/api` — the `handle_path` rule
-strips the `/api` prefix before the controller sees the route.
+strips the `/api` prefix before the controller sees the route. With the variable
+unset the stdio server probes both once at launch, so the repo's `.mcp.json`
+works against either stack; a stack that is down at launch leaves it on `:7701`
+until the MCP server is restarted. Set the variable for any other host.
 
 ---
 

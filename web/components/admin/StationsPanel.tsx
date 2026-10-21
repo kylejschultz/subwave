@@ -1,11 +1,6 @@
 'use client';
 
-// Stations rack. Installs are capped at MAX_STATIONS=8 server-side (GET
-// /stations `limit`). Activating a station — or creating the SECOND station,
-// which converts a single-station install — restarts the controller, so both
-// flows funnel into one full-screen "re-tuning" state that hard-reloads once
-// /state reports the new station booted (boot-frozen station.id).
-// API: controller/src/routes/stations.ts.
+// Activation and creating a second station restart the controller. Wait for /state to report the new station ID before reloading.
 
 import { useMemo, useRef, useState } from 'react';
 import { useAdminAuth } from '../../lib/adminAuth';
@@ -40,8 +35,8 @@ interface StationCreateReceipt {
   fieldErrors?: Record<string, string>;
 }
 
-// A stable pseudo-frequency on the 88–108 FM band, hashed from the station id
-// so it keeps its spot as the rack changes. Pure presentation.
+// Stable pseudo-frequency on the 88–108 FM band, hashed from the station id.
+// Pure presentation.
 function assignFrequencies(stations: StationRow[]): Map<string, number> {
   const taken = new Set<number>();
   const out = new Map<string, number>();
@@ -115,14 +110,12 @@ export default function StationsPanel() {
   const [confirm, setConfirm] = useState<{ type: 'live' | 'del'; s: StationRow } | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [renaming, setRenaming] = useState<StationRow | null>(null);
-  // Both dialogs validate against the SAME schemas the controller enforces, so
-  // an over-long or empty name is refused under the input before a request is
-  // sent — and the messages match the ones a 400 would carry.
+  // Both dialogs validate against the same schemas the controller enforces, so
+  // a bad name is refused before a request is sent, with the same message.
   const createForm = useZodForm(stationCreateSchema, { name: '', mode: 'fresh' });
   const renameForm = useZodForm(stationRenameSchema, { name: '' });
   const createName = createForm.watch('name');
-  // `mode` is optional in z.input because the schema defaults it — the ?? just
-  // restates that default, since every reset() below sets it explicitly.
+  // `mode` is optional in z.input (schema default); the ?? restates it.
   const createMode = createForm.watch('mode') ?? 'fresh';
   const setCreateMode = (mode: StationCreateMode) =>
     createForm.setValue('mode', mode, { shouldValidate: true, shouldDirty: true });
@@ -188,8 +181,8 @@ export default function StationsPanel() {
     try {
       const j = await createMutation.mutateAsync(values);
       if (j.error) {
-        // Converted-but-create-failed wedge: the conversion is durable and the
-        // controller restarts regardless — enter the re-tuning state anyway.
+        // The conversion is durable and the controller restarts regardless, so
+        // enter re-tuning even when the create failed.
         if (j.switching) {
           notify.err(
             `Create failed: ${j.error} — the controller is restarting anyway to finish converting to multi-station.`,
@@ -199,10 +192,9 @@ export default function StationsPanel() {
           setSwitching(CONVERT_SENTINEL);
           return;
         }
-        // "no active station to duplicate from" is a rule only the server can
-        // check — it reads the live pointer off disk — so it comes back keyed
-        // to `mode` and lands under the Fresh/Duplicate picker, where the fix
-        // (choose Fresh) actually is.
+        // Only the server can check "no active station to duplicate from" (it
+        // reads the live pointer off disk), so it comes back keyed to `mode`
+        // and lands under the Fresh/Duplicate picker.
         applyServerFieldErrors(createForm, j.fieldErrors);
         throw new Error(j.error);
       }
@@ -425,9 +417,8 @@ export default function StationsPanel() {
           {stations.map((s, i) => (
             <div
               key={s.id ?? '__install'}
-              /* Phone: preset tile + identity, with the action cluster on its
-                 own row — a 96px tile, two 24px gaps and three buttons leave
-                 the name column barely 100px wide at 390. */
+              /* Phone: preset tile + identity, actions on their own row; a
+                 96px tile plus gaps and three buttons leave ~100px at 390. */
               className="grid grid-cols-[96px_minmax(0,1fr)] items-center gap-x-4 border-t border-separator-strong first:border-t-0 sm:grid-cols-[96px_1fr_auto] sm:gap-6"
             >
               <div
@@ -591,10 +582,6 @@ export default function StationsPanel() {
                 if (e.key === 'Enter' && !busy && !atCap) void create();
               }}
             />
-            {/* The exact function the server slugifies with, out of the shared
-                schema — this used to be a hand-copied reimplementation that had
-                already dropped the "nothing usable" fallback, so a name like
-                "!!!" previewed blank and then arrived as /station. */}
             <FieldDescription
               {...createNameAria.descriptionProps}
               className="font-mono text-[10px] tracking-[0.1em] text-muted lowercase"
@@ -607,10 +594,7 @@ export default function StationsPanel() {
             />
           </Field>
 
-          {/* No single labelable control, so the Field names the group itself
-              rather than pointing htmlFor at a <div>. The buttons are real
-              radios, so the group they belong to has to say so — role="radio"
-              outside a radiogroup is an orphan to a screen reader. */}
+          {/* The radio buttons need a named radiogroup. */}
           <Field data-invalid={createModeAria.invalid}>
             <FieldLabel asChild {...createModeAria.labelledByProps}>
               <span>Starting point</span>
@@ -630,7 +614,7 @@ export default function StationsPanel() {
                   {
                     id: 'duplicate' as const,
                     label: 'Duplicate current',
-                    desc: `Copies ${live?.name ?? 'the live station'}'s settings, DJ personas, schedule, library analysis, jingles, beds and voices. Play history starts clean.`,
+                    desc: `Copies ${live?.name ?? 'the live station'}'s settings, DJ personas, schedule, jingles, beds and voices. Requires its own Navidrome connection; library and play history start empty.`,
                   },
                 ] as const
               ).map(opt => (

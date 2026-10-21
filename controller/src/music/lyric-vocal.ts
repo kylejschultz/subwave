@@ -1,19 +1,8 @@
-// Lyric-derived vocal activity (issue #1125). Navidrome already indexes timed
-// (synced) lyrics — the plain `subsonic.getLyrics()` flattens them to text for
-// embeddings and throws the per-line timings away. `getStructuredLyrics()`
-// preserves the timings, and this pure module turns them into the same
-// {startMs,endMs} vocal ranges the Demucs detector emits.
-//
-// Why this is worth it: Demucs never separates cleanly, so an instrumental's
-// "vocal" stem carries residual bleed (pad swells, cymbals, guitar harmonics)
-// that a self-relative energy gate mistakes for singing (the mass false-positive
-// in #1125). A synced lyric line is ground truth — the vocal starts exactly when
-// the line does. So when a track has usable timed lyrics we skip the detector
-// entirely; an explicit "instrumental" marker tags it instrumental for free; and
-// anything inconclusive (no lyrics, or unsynced text with no timing) returns
-// null so the caller falls back to Demucs (now with the mix-anchored floor).
-//
-// Pure + side-effect-free: unit-pinned by scripts/lyric-vocal.test.ts.
+// Lyric-derived vocal activity (#1125): synced lyric timings turned into the same
+// {startMs,endMs} ranges the Demucs detector emits. Usable timed lyrics outrank
+// Demucs; anything inconclusive returns null and the caller falls back to it.
+
+import { z } from 'zod';
 
 interface LyricLine {
   startMs: number; // milliseconds from track start; NaN when unsynced
@@ -31,15 +20,66 @@ export interface Section {
 }
 
 export interface LyricVocalResult {
-  instrumental: boolean; // true → vocalRanges is []
-  vocalRanges: Section[]; // [] for an instrumental
-  introMs: number | null; // first vocal onset, or null for an instrumental
+  instrumental: boolean; // duration classification; short spans remain below
+  vocalRanges: Section[];
+  introMs: number | null; // first measured vocal onset, or null for no spans
 }
 
-// A lyric "body" that is really a no-lyrics/instrumental marker, not sung words.
-// Covers the LRC `[au: instrumental]` metadata tag some players surface as a
-// line and the common single-line "Instrumental" placeholder. Anchored to the
-// whole string so a song that merely SINGS the word "instrumental" isn't caught.
+// #1655: Roman Twilight has 2,961ms of Demucs bleed; 1,881 tracks in the
+// reported library have <5s total. Use a fixed tolerance because the measured
+// windows need not cover the whole track. Equality remains vocal.
+export const INSTRUMENTAL_VOCAL_TOLERANCE_MS = 5_000;
+const vocalSection = z.object({
+  startMs: z.number().finite().nonnegative(),
+  endMs: z.number().finite(),
+  kind: z.unknown().optional(),
+}).refine((r) => r.endMs > r.startMs);
+const vocalSections = z.array(vocalSection);
+
+// The one track classification rule. Unknown stays unknown; malformed non-empty
+// ranges stay vocal rather than granting instrumental eligibility. Timing rules
+// still inspect the original spans, including a short phrase below this tolerance.
+export function isInstrumental(vocalRanges: unknown[] | null | undefined, vocalRangesInvalid = false): boolean | null {
+  if (vocalRangesInvalid) return false;
+  if (vocalRanges == null) return null;
+  const parsed = vocalSections.safeParse(vocalRanges);
+  if (!parsed.success) return false;
+  return parsed.data.reduce((ms, r) => ms + r.endMs - r.startMs, 0)
+    < INSTRUMENTAL_VOCAL_TOLERANCE_MS;
+}
+
+// Keep bad-span evidence beside clean timing spans; dropping it would let a
+// partial measurement earn instrumental eligibility after a normal row read.
+export function parseVocalRangesJson(json: string | null | undefined): {
+  vocalRanges: Array<Section & { kind?: string }> | null;
+  vocalRangesInvalid: boolean;
+} {
+  try {
+    const ranges: unknown = json == null ? null : JSON.parse(json);
+    if (Array.isArray(ranges)) {
+      const vocalRanges: Array<Section & { kind?: string }> = [];
+      let vocalRangesInvalid = false;
+      for (const range of ranges) {
+        const parsed = vocalSection.safeParse(range);
+        if (!parsed.success) { vocalRangesInvalid = true; continue; }
+        const { startMs, endMs, kind } = parsed.data;
+        vocalRanges.push(typeof kind === 'string' ? { startMs, endMs, kind } : { startMs, endMs });
+      }
+      return { vocalRanges, vocalRangesInvalid };
+    }
+  } catch { /* unreadable measurements stay unknown */ }
+  return { vocalRanges: null, vocalRangesInvalid: false };
+}
+
+// Registered as a deterministic SQLite scalar so SQL filters use the JS rule.
+export function instrumentalFromJson(json: string | null): number | null {
+  const { vocalRanges, vocalRangesInvalid } = parseVocalRangesJson(json);
+  const instrumental = isInstrumental(vocalRanges, vocalRangesInvalid);
+  return instrumental == null ? null : Number(instrumental);
+}
+
+// LRC `[au: instrumental]` / "Instrumental" placeholder. Anchored, so a song that
+// merely sings the word isn't caught.
 const INSTRUMENTAL_RE = /^\s*[[(]?\s*(?:au\s*:\s*)?instrumental\s*[)\]]?\s*$/i;
 
 // Exported so the public lyrics payload (`music/lyrics-public.ts`) screens the
@@ -49,31 +89,25 @@ export function isInstrumentalMarker(text: string): boolean {
   return INSTRUMENTAL_RE.test(text);
 }
 
-// Consecutive sung lines closer than this merge into one vocal range; a wider
-// gap (a solo, an instrumental bridge) splits them so the ranges expose real
-// vocal-free stretches. 8s keeps a verse together but still surfaces breaks.
+// Consecutive sung lines closer than this merge into one range; a wider gap
+// splits them so the ranges expose real vocal-free stretches.
 const MERGE_GAP_MS = 8_000;
-// A line extends until the next line, capped so a long trailing gap before the
-// next line reads as an instrumental break rather than sustained singing.
+// A line extends to the next line, capped so a long trailing gap reads as an
+// instrumental break rather than sustained singing.
 const MAX_LINE_MS = 8_000;
 // The final line has no successor to bound it — give it a nominal sung tail.
 const LAST_LINE_TAIL_MS = 4_000;
 
-// Turn structured lyrics into vocal ranges + an intro cue, or null when the
-// input can't decide (caller falls back to Demucs). `null` in / no usable timing
-// → null out; an all-marker body → instrumental ([]); synced timed lines →
-// merged ranges with the first onset as the intro.
+// Structured lyrics → vocal ranges + intro cue, or null when inconclusive.
 export function deriveVocalFromLyrics(lyrics: StructuredLyrics | null): LyricVocalResult | null {
   if (!lyrics) return null;
   const lines = lyrics.lines.filter((l) => l.text.trim().length > 0);
 
-  // Explicit instrumental marker: every non-empty line is the marker text.
   if (lines.length > 0 && lines.every((l) => isInstrumentalMarker(l.text))) {
     return { instrumental: true, vocalRanges: [], introMs: null };
   }
 
-  // Placing vocals in time needs real timestamps; unsynced text or a body with
-  // no timed lines is inconclusive — let Demucs handle it.
+  // Unsynced text, or a body with no timed lines, is inconclusive.
   if (!lyrics.synced) return null;
   const timed = lines
     .filter((l) => Number.isFinite(l.startMs) && l.startMs >= 0)
@@ -93,15 +127,12 @@ export function deriveVocalFromLyrics(lyrics: StructuredLyrics | null): LyricVoc
     }
   }
 
-  return { instrumental: false, vocalRanges: ranges, introMs: ranges[0].startMs };
+  return { instrumental: isInstrumental(ranges) === true, vocalRanges: ranges, introMs: ranges[0].startMs };
 }
 
-// Clip whole-track vocal ranges into a track's outro window — the lyric
-// counterpart of the worker's tail Demucs pass (feature: vocal-aware
-// transitions). Spans are trimmed to the window (and to the track end when
-// known, since the nominal last-line tail can outrun it); [] = no sung line
-// reaches the window, i.e. an instrumental tail, mirroring the worker's
-// tri-state semantics.
+// Clip whole-track ranges into the outro window, the lyric counterpart of the
+// worker's tail Demucs pass. Trimmed to the track end when known (the nominal
+// last-line tail can outrun it); [] means an instrumental tail.
 export function clipRangesToTail(
   ranges: Section[],
   windowStartMs: number,

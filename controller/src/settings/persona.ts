@@ -14,9 +14,11 @@ import {
   coerceShowEras,
   coerceShowGenres,
   coerceShowMoods,
+  isDefaultTakeover,
   personaToneDirectives,
+  takeoverShowId,
 } from './vocab.js';
-import { DEFAULTS, coerceMaxTrackSeconds } from './defaults.js';
+import { DEFAULTS, coerceMaxTrackSeconds, coerceMinTrackLengthSeconds } from './defaults.js';
 import { get, peek } from './store.js';
 
 // DJ mode makes a persona behave like a working radio DJ rather than a
@@ -38,11 +40,14 @@ export function effectiveFrequency(persona: unknown = getEffectivePersona()) {
   return FREQUENCIES[Math.min(i + 1, FREQUENCIES.length - 1)];
 }
 
-// Single gate for the transition effects (filter sweep + echo washout): they're
-// on whenever the on-air persona is in DJ mode — no separate toggle. The picker
-// schema/prompt builders use this to decide whether to offer the DJ the
-// `transition` choice; when off, the guidance is never shown and nothing is
-// applied.
+// Gate for the six DJ transition effects (TRANSITION_EFFECTS): on whenever the
+// on-air persona is in DJ mode. The per-effect operator switches
+// (settings/transition-effects.ts, #1565) narrow it and compose with it at the
+// call sites, never in here. The picker schema/prompt builders use this to
+// decide whether to offer the DJ the `transition` choice; when off, the
+// guidance is never shown and nothing is applied. DJ mode also drives
+// pair-drain, stem blends and the transition stinger, which read djMode
+// directly.
 export function effectsActive(persona: unknown = getEffectivePersona()): boolean {
   return !!(persona as { djMode?: unknown } | null | undefined)?.djMode;
 }
@@ -55,6 +60,38 @@ export function effectsActive(persona: unknown = getEffectivePersona()): boolean
 // the string compare, same precedent as effectsActive() above.
 export function announceLinks(persona: unknown = getEffectivePersona()): boolean {
   return (persona as { linkStyle?: unknown } | null | undefined)?.linkStyle === 'announce';
+}
+
+// A private, music-specific editorial preference for track selection. It is
+// intentionally separate from Soul: Soul informs the DJ's voice, while Music
+// Leanings can only break a close tie between already eligible candidates.
+export function personaMusicLeanings(persona: unknown = getEffectivePersona()): string | null {
+  const leaning = String((persona as { musicLean?: unknown } | null | undefined)?.musicLean || '').trim();
+  return leaning || null;
+}
+
+export type GuestEditorialNudge = {
+  guest: { id: string; name: string };
+  musicalLeanings: string;
+};
+
+// Guests can occasionally add a music-specific secondary nudge. The host
+// remains the primary editorial influence, and a guest's Soul stays strictly
+// on-air character rather than programming input.
+export function guestEditorialNudgeFromGuests(
+  guests: Array<{ id?: unknown; name?: unknown; musicLean?: unknown }>,
+  random: () => number = Math.random,
+): GuestEditorialNudge | null {
+  const eligible = guests.filter((guest) => String(guest.musicLean || '').trim());
+  if (!eligible.length || random() >= 0.25) return null;
+  const guest = eligible[Math.floor(random() * eligible.length)];
+  if (!guest || typeof guest.id !== 'string' || typeof guest.name !== 'string') return null;
+  return { guest: { id: guest.id, name: guest.name }, musicalLeanings: String(guest.musicLean).trim() };
+}
+
+export function guestEditorialNudge(date: Date = new Date(), random: () => number = Math.random) {
+  if (get().llm?.guestMusicalLeanings !== true) return null;
+  return guestEditorialNudgeFromGuests(getOnAirRoster(date).guests, random);
 }
 
 // Effective track-length cap in SECONDS for the moment a pick is made, or null
@@ -72,6 +109,55 @@ export function effectiveMaxTrackSec(
     : null;
   const sec = showSec != null ? showSec : station;
   return sec && sec > 0 ? sec : null;
+}
+
+// One policy result for selection and playback; malformed/absent mode is legacy cut.
+export function effectiveTrackLengthLimits(
+  show: { maxTrackSeconds?: unknown } | null | undefined = resolveActiveShow(),
+  s: { maxTrackSeconds?: unknown; maxTrackLengthMode?: unknown } | null | undefined = get(),
+): { selectionMaxSec: number | null; playbackMaxSec: number | null } {
+  const maxSec = effectiveMaxTrackSec(show, s);
+  return s?.maxTrackLengthMode === 'exclude'
+    ? { selectionMaxSec: maxSec, playbackMaxSec: null }
+    : { selectionMaxSec: null, playbackMaxSec: maxSec };
+}
+
+// Effective minimum track length in SECONDS for the moment a pick is made, or
+// null for "no floor" (#1573). Exactly the precedence effectiveMaxTrackSec
+// applies to the cap: a scheduled show's own floor (when set) overrides the
+// station default, and 0 at the winning level means off. One resolver so both
+// pick paths, the auto-playlist coast and the show-editor diagnostic cannot
+// disagree about how short is too short.
+//
+// The two are NOT symmetric in what they do with the answer: the cap is an
+// on-air cue_out cut in legacy mode (a hard ceiling in exclude), while the floor is
+// a SELECTION filter — a 40-second interlude cannot be stretched.
+export function effectiveMinTrackSec(
+  show: { minTrackLengthSeconds?: unknown } | null | undefined = resolveActiveShow(),
+  s: { picker?: { minTrackLengthSeconds?: unknown } } | null | undefined = get(),
+): number | null {
+  const station = coerceMinTrackLengthSeconds(s?.picker?.minTrackLengthSeconds, false) ?? 0;
+  const showSec = show && show.minTrackLengthSeconds != null
+    ? coerceMinTrackLengthSeconds(show.minTrackLengthSeconds, false)
+    : null;
+  const sec = showSec != null ? showSec : station;
+  return sec && sec > 0 ? sec : null;
+}
+
+// Whether the show ENDING at a boundary wants its last track faded out there
+// rather than spilling into the next show (#1574). Same precedence shape as
+// effectiveMaxTrackSec above and for the same reason — one resolver, so the
+// drain and any future caller cannot disagree about which level wins.
+//
+// The show's value is TRI-STATE: null means "inherit", so a station that turns
+// the default on gets it on every show that never expressed an opinion. Absent
+// at both levels is false, i.e. the pre-existing behaviour.
+export function effectiveFadeAtShowEnd(
+  show: { fadeAtShowEnd?: unknown } | null | undefined = resolveActiveShow(),
+  s: { fadeAtShowEnd?: unknown } | null | undefined = get(),
+): boolean {
+  if (show && typeof show.fadeAtShowEnd === 'boolean') return show.fadeAtShowEnd;
+  return s?.fadeAtShowEnd === true;
 }
 
 // ── persona / show resolution ───────────────────────────────────────────────
@@ -96,7 +182,11 @@ export function resolveActiveShow(date = new Date(), s = get()) {
   // airtime — naturally straddle the pin's start/end boundary.
   const ov = s?.scheduleOverride;
   if (ov && date.getTime() >= ov.startedAt && date.getTime() < ov.expiresAt) {
-    const pinned = s.shows?.find(x => x.id === ov.showId);
+    // A live null target is an explicit Default programming takeover. It must
+    // stop here rather than falling through to the weekly grid.
+    if (isDefaultTakeover(ov)) return null;
+    const pinnedId = takeoverShowId(ov);
+    const pinned = pinnedId ? s.shows?.find(x => x.id === pinnedId) : null;
     // A dangling showId (show deleted mid-takeover) voids the override.
     if (pinned) return resolveShowShape(pinned, s);
   }
@@ -110,14 +200,25 @@ export function resolveActiveShow(date = new Date(), s = get()) {
   return resolveShowShape(show, s);
 }
 
-// The takeover currently in force, or null (absent, expired, or dangling —
-// the same voiding rules resolveActiveShow applies). Route/janitor helper.
+// A stored show by id, in the same resolved shape the pick paths read — for
+// operator surfaces about a show that need not be on air (the in-order
+// position peek in routes/shows.ts). null when no such show exists.
+export function resolveShowById(id: string, s = get()) {
+  const show = s?.shows?.find(x => x.id === id);
+  return show ? resolveShowShape(show, s) : null;
+}
+
+// The takeover currently in force, or null (absent, expired, or a target that
+// names nothing real — a dangling or malformed show id). An explicit null
+// target is a valid Default programming takeover. Route/janitor helper.
 export function getScheduleOverride(now = Date.now()) {
   const s = get();
   const ov = s?.scheduleOverride;
   if (!ov) return null;
   if (now >= ov.expiresAt) return null;
-  if (!s.shows?.some(x => x.id === ov.showId)) return null;
+  if (isDefaultTakeover(ov)) return ov;
+  const pinnedId = takeoverShowId(ov);
+  if (!pinnedId || !s.shows?.some(x => x.id === pinnedId)) return null;
   return ov;
 }
 
@@ -148,11 +249,31 @@ function resolveShowShape(show, s) {
     // Per-show track-length cap override (seconds). null = inherit the station
     // default; 0 = unlimited; >0 = own cap. See effectiveMaxTrackSec().
     maxTrackSeconds: show.maxTrackSeconds != null ? show.maxTrackSeconds : null,
+    // Per-show minimum-track-length FLOOR (#1573). null = inherit the station
+    // default (picker.minTrackLengthSeconds); 0 = no floor; >0 = own floor.
+    // See effectiveMinTrackSec(). Omitting it here would silently disable the
+    // per-show override on every pick path — resolveShowShape is what they see.
+    minTrackLengthSeconds: show.minTrackLengthSeconds != null ? show.minTrackLengthSeconds : null,
+    // Per-show show-boundary fade override. null = inherit the station default.
+    // See effectiveFadeAtShowEnd() — a resolved show that dropped this field
+    // would read as "inherit" on every path, which is how the #779 blocklist
+    // no-op happened.
+    fadeAtShowEnd: typeof show.fadeAtShowEnd === 'boolean' ? show.fadeAtShowEnd : null,
+    // Explicit opt-in; an older persisted show keeps ordinary ducked speech.
+    pauseTalk: show.pauseTalk === true,
     // Navidrome playlist anchor: the union of these playlists becomes the show's
     // candidate pool (music/show-playlist.ts). playlistStrict makes it the show's
     // entire universe; soft just lets it dominate. Empty array = no anchor.
     playlistIds: Array.isArray(show.playlistIds) ? show.playlistIds.filter((v: unknown) => typeof v === 'string') : [],
     playlistStrict: show.playlistStrict === true,
+    // Full rotation (#1612): every anchor track airs once before any repeats.
+    // Read off the RESOLVED show by music/show-recency.ts, so omitting it here
+    // would make the switch a silent no-op on every pick path — the #779
+    // blocklist failure, exactly.
+    playlistExhaust: show.playlistExhaust === true,
+    // Play in order: read off the RESOLVED show by the in-order branch in
+    // broadcast/dj-agent.ts, so a missing line here is the #779 no-op again.
+    playlistInOrder: show.playlistInOrder === true,
     // Navidrome playlist blocklist: tracks in these playlists are hard-dropped
     // from the show's candidate pool (resolveExcludedPlaylistIds reads this off
     // the RESOLVED show, so omitting it here silently disabled the whole
@@ -177,6 +298,7 @@ function resolveShowShape(show, s) {
     // optional segmentSkill pins the feature beat to one capability kind.
     programme: show.programme === true,
     segmentSkill: typeof show.segmentSkill === 'string' ? show.segmentSkill : '',
+    preparationSkill: typeof show.preparationSkill === 'string' ? show.preparationSkill : '',
   };
 }
 

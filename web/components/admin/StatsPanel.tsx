@@ -1,10 +1,7 @@
 'use client';
 
-/* Admin Stats page. Two data sources, two cadences:
-   - GET /stats (5s) aggregates the in-memory LLM / TTS / DJ-log / request rings
-     (since boot, lost on restart by design).
-   - GET /listeners (30s) returns the durable listener time-series persisted to
-     state/listeners.jsonl (24h–7d), drawn as the Audience trend chart. */
+// /stats reports activity since boot, except `transitions`, which is read from the
+// play history; /listeners reports persisted audience history.
 
 import type { ReactNode } from 'react';
 import { useEffect, useRef, useState } from 'react';
@@ -24,6 +21,8 @@ import {
   type HourBucket,
 } from '../../lib/audienceStats';
 import { statsKeys } from './stats-queries';
+import type { MixDropReason, TransitionEffect } from '@/lib/schemas.generated';
+import { countRows, dropReasonLabel, effectLabel, effectSeamCount, reasonSummary } from '../../lib/transitionStats';
 
 interface LatencyStats {
   avg?: number;
@@ -52,6 +51,27 @@ interface ByModelRow {
   tokens?: number;
   costUsd?: number;
   priced?: boolean;
+}
+
+interface ContextWindowRow {
+  kind: string;
+  calls: number;
+  samples: number;
+  averageInputTokens: number | null;
+  peakInputTokens: number | null;
+}
+
+interface ShortlistContextWindow {
+  samples: number;
+  // Largest prompt the window must hold: this route's picker plus every LLM
+  // function sharing the one num_ctx. pickerPeakInputTokens is the route's own.
+  peakInputTokens: number | null;
+  pickerPeakInputTokens?: number | null;
+  peakKind?: string | null;
+  suggestedTokens: number | null;
+  headroomPct?: number;
+  responseReserveTokens?: number;
+  message: string;
 }
 
 interface ByEngineRow {
@@ -85,6 +105,11 @@ interface LlmStats {
   agent: { calls: number; avgSteps?: number; avgTools?: number };
   byKind: ByKindRow[];
   byModel: ByModelRow[];
+  contextWindows?: {
+    shortlist: ShortlistContextWindow;
+    agenticPicker: ShortlistContextWindow;
+    byKind: ContextWindowRow[];
+  };
   activeModel?: string;
   budget?: {
     enabled: boolean;
@@ -143,11 +168,28 @@ interface RequestsStats {
   topRequesters: TopRequesterRow[];
 }
 
+// The durable seam record, from library.db `plays` over the last `days` days —
+// unlike the in-memory rollups above, it survives a controller restart. Null
+// when the library DB is unavailable.
+interface TransitionStats {
+  days: number;
+  since: string;
+  seams: number;                          // plays with a recorded seam label
+  bySeam: Record<string, number>;         // label of the seam INTO the track ('Normal', 'Washout + Sweep', …)
+  asked: number;                          // DJ picks with a recorded ask
+  byAsk: Record<string, number>;          // the DJ's ask before any strip ('normal' | effect id)
+  dropped: number;
+  byReason: Partial<Record<MixDropReason, number>>;
+  byEffect: Partial<Record<TransitionEffect, Partial<Record<MixDropReason, number>>>>;
+}
+
 interface StatsResponse {
   llm?: LlmStats;
+  trackSelection?: 'agentic' | 'shortlist';
   tts?: TtsStats;
   djLog?: DjLogStats;
   requests?: RequestsStats;
+  transitions?: TransitionStats | null;
   error?: string;
 }
 
@@ -173,9 +215,8 @@ interface AudienceResponse {
   error?: string;
 }
 
-// Already deduped one-row-per-listener by the server. `error` is set on a 502
-// (Icecast admin unreachable) so the UI can tell "nobody connected" from
-// "couldn't read the live detail".
+// Deduped one row per listener by the server. `error` is set on a 502 (Icecast
+// admin unreachable) so "nobody connected" stays distinct from "couldn't read".
 interface ConnectionsResponse {
   count?: number;
   connections?: ListenerConnection[];
@@ -226,8 +267,7 @@ const fmtTokens = (n: number | null | undefined): string => {
   return String(n);
 };
 
-// One-decimal mean for the listener average — counts are small integers, so a
-// single decimal reads better than a rounded whole.
+// One-decimal mean; counts are small integers.
 const fmtAvg = (n: number | null | undefined): string =>
   n == null ? '—' : (Math.round(n * 10) / 10).toLocaleString('en-GB');
 
@@ -274,9 +314,8 @@ function MetricStrip({ children }: MetricStripProps) {
   const count = Array.isArray(children) ? children.length : 1;
   const ref = useRef<HTMLDivElement>(null);
   useDynamicStyle(ref, { gridTemplateColumns: `repeat(${count}, 1fr)` });
-  // `.strip-mobile` reflows to 2 columns under 640px, but StatCell divides with
-  // a RIGHT rule while that helper only clears LEFT ones, so the cell ending
-  // each mobile row left a divider dangling against the card edge.
+  // `.strip-mobile` reflows to 2 columns under 640px and clears LEFT rules only;
+  // StatCell divides with a RIGHT rule, so clear the row-ending one here.
   return (
     <div
       ref={ref}
@@ -318,9 +357,8 @@ function Table<R>({ cols, rows, empty }: TableProps<R>) {
   if (!rows?.length) {
     return <span className="field-hint italic">{empty}</span>;
   }
-  // The wrapper is only a scroll container below sm:. From sm: up overflow-x
-  // must stay `visible`, because the sticky <thead> would otherwise resolve
-  // against this div instead of the ScrollBox viewport.
+  // Scroll container below sm: only. From sm: up overflow-x must stay `visible`
+  // or the sticky <thead> resolves against this div, not the ScrollBox viewport.
   return (
     <div className="w-full overflow-x-auto sm:overflow-x-visible">
       <table className="w-full border-collapse">
@@ -331,8 +369,7 @@ function Table<R>({ cols, rows, empty }: TableProps<R>) {
                 key={c.key}
                 className={cn(
                   'caption border-b border-separator-strong px-2 py-1 whitespace-nowrap',
-                  // Sticky so the header stays put when the table is wrapped in
-                  // a ScrollBox; the card-bg masks rows scrolling underneath.
+                  // Sticky for the ScrollBox case; card-bg masks rows underneath.
                   'sticky top-0 z-[1] bg-[var(--card-bg)]',
                   c.align === 'right' && 'text-right',
                   c.align === 'center' && 'text-center',
@@ -377,8 +414,7 @@ function BarList({ rows, max }: { rows: BarRow[]; max: number }) {
   return (
     <div className="grid gap-1.5">
       {rows.map(r => (
-        // The label column gives up 22px on a phone so the bar and its trailing
-        // figure still fit on one line inside a 390px card.
+        // Narrower label on a phone so bar + figure fit one line in a 390px card.
         <div key={r.label} className="flex items-center gap-2.5 text-[12px]">
           <span className="w-[88px] shrink-0 truncate text-muted sm:w-[110px]" title={r.label}>
             {r.label}
@@ -391,9 +427,7 @@ function BarList({ rows, max }: { rows: BarRow[]; max: number }) {
   );
 }
 
-// Caps a breakdown to a scrollable area so a long tail can't stretch the card
-// down the page. Tables wrapped here keep their header visible via the sticky
-// <thead> in <Table>, which resolves against the ScrollArea viewport.
+// Caps a long-tail breakdown; the sticky <thead> resolves against this viewport.
 function ScrollBox({ children }: { children: ReactNode }) {
   return <ScrollArea className="max-h-[260px]">{children}</ScrollArea>;
 }
@@ -413,8 +447,7 @@ function ListenerChart({ samples }: { samples: ListenerSample[] }) {
   const H = 100;
   const counts = samples.map(s => s.count);
   const peak = Math.max(...counts);
-  // 12% headroom so the peak sits just below the top edge and the dashed peak
-  // line is visible rather than flush against the frame.
+  // 12% headroom so the dashed peak line is not flush against the frame.
   const drawMax = peak > 0 ? peak * 1.12 : 1;
   const n = samples.length;
   const x = (i: number) => (i / (n - 1)) * W;
@@ -457,8 +490,7 @@ function ListenerChart({ samples }: { samples: ListenerSample[] }) {
   );
 }
 
-// Height is per-hour dynamic, so it goes through useDynamicStyle — the lint
-// rule forbids `style={…}`.
+// Per-hour height goes through useDynamicStyle; the lint rule forbids `style={…}`.
 function HourColumn({ frac, title }: { frac: number; title: string }) {
   const ref = useRef<HTMLSpanElement>(null);
   useDynamicStyle(ref, { height: `${Math.max(2, Math.round(frac * 100))}%` });
@@ -515,6 +547,100 @@ const RANGE_OPTIONS = [
 
 class StatsShapeError extends Error {}
 
+interface EffectDropRow {
+  effect: string;
+  count: number;
+  reasons: string;
+}
+
+// The durable seam record as three views of one pipeline: what the DJ asked for
+// on its picks, what each seam was armed with, and why asks did not make it.
+// `t` is null when the play history is unavailable; the caller hides the card
+// altogether for a controller too old to send the key.
+function TransitionsCard({ t }: { t: TransitionStats | null }) {
+  const sub = `last ${t?.days ?? 7} days · from the play history, so it survives restarts`;
+  if (!t || t.seams === 0) {
+    return (
+      <Card title="Transitions" sub={sub}>
+        <span className="field-hint italic">
+          {!t
+            ? 'play history unavailable'
+            : 'no transitions recorded yet — each aired track records how it came in'}
+        </span>
+      </Card>
+    );
+  }
+  const asks = countRows(t.byAsk, effectLabel);
+  const seams = countRows(t.bySeam);
+  const reasons = countRows(t.byReason, dropReasonLabel);
+  const withEffect = effectSeamCount(t.bySeam);
+  const effectAsks = t.asked - (t.byAsk.normal ?? 0);
+  const effectRows: EffectDropRow[] = Object.entries(t.byEffect ?? {})
+    .map(([effect, rec]) => ({
+      effect: effectLabel(effect),
+      count: Object.values(rec ?? {}).reduce<number>((sum, n) => sum + (n || 0), 0),
+      reasons: reasonSummary(rec),
+    }))
+    .filter(r => r.count > 0)
+    .sort((a, b) => b.count - a.count || a.effect.localeCompare(b.effect));
+  return (
+    <Card title="Transitions" sub={sub}>
+      <div className="grid gap-0">
+        <MetricStrip>
+          <StatCell label="Seams" value={fmtInt(t.seams)} sub="aired tracks with a recorded way in" />
+          <StatCell label="With an effect" value={fmtInt(withEffect)} accent={withEffect > 0}
+            sub={`${fmtPct(withEffect / t.seams)} of seams`} />
+          <StatCell label="DJ asks" value={fmtInt(t.asked)} sub={`${fmtInt(effectAsks)} for an effect`} />
+          <StatCell label="Dropped" value={fmtInt(t.dropped)} last
+            sub="effects that did not air as chosen" />
+        </MetricStrip>
+
+        <div className="stack-mobile grid grid-cols-[1fr_1fr_1fr] gap-0">
+          <div className="border-b border-separator-soft p-3.5 sm:border-r sm:border-b-0">
+            <div className="caption mb-2">the DJ asked for</div>
+            {asks.length ? (
+              <BarList max={asks[0]?.count || 1} rows={asks} />
+            ) : (
+              <span className="field-hint italic">no DJ picks recorded</span>
+            )}
+          </div>
+          <div className="border-b border-separator-soft p-3.5 sm:border-r sm:border-b-0">
+            <div className="caption mb-2">seams armed</div>
+            <BarList max={seams[0]?.count || 1} rows={seams} />
+          </div>
+          <div className="p-3.5">
+            <div className="caption mb-2">why effects were dropped</div>
+            {reasons.length ? (
+              <BarList max={reasons[0]?.count || 1} rows={reasons} />
+            ) : (
+              <span className="field-hint italic">nothing dropped</span>
+            )}
+          </div>
+        </div>
+
+        {effectRows.length > 0 && (
+          <div className="border-t border-separator-soft p-3.5">
+            <div className="caption mb-2">drops by effect</div>
+            <ScrollBox>
+              <Table<EffectDropRow>
+                empty="No drops"
+                rows={effectRows}
+                cols={[
+                  { key: 'effect', label: 'Effect' },
+                  { key: 'count', label: 'Dropped', align: 'right',
+                    render: r => <span className="mono-num">{r.count}</span> },
+                  { key: 'reasons', label: 'Why',
+                    render: r => <span className="text-muted">{r.reasons}</span> },
+                ]}
+              />
+            </ScrollBox>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 export default function StatsPanel() {
   const { adminFetch, needsAuth, hydrated } = useAdminAuth();
   const [paused, setPaused] = useState(false);
@@ -534,9 +660,8 @@ export default function StatsPanel() {
     },
   });
 
-  // /listeners — durable time-series for the Audience chart, 30s (it reads the
-  // JSONL history file and moves slowly). Soft-fails: a miss leaves the last
-  // reading in place rather than erroring the page.
+  // /listeners — durable time-series for the Audience chart, 30s. Soft-fails:
+  // a miss leaves the last reading in place rather than erroring the page.
   const listenersQuery = useAdminQuery<ListenersResponse>({
     key: statsKeys.listeners(range), adminFetch, enabled, staleTime: 0,
     refetchInterval: () => 30_000,
@@ -544,17 +669,15 @@ export default function StatsPanel() {
     request: (fetcher, signal) => adminJson(fetcher, `/listeners?sinceMinutes=${range}`, undefined, signal),
   });
 
-  // /audience — durable referral/geo rollup, 30s, soft-fail (same cadence and
-  // failure handling as /listeners).
+  // /audience — durable referral/geo rollup, 30s, soft-fail like /listeners.
   const audienceQuery = useAdminQuery<AudienceResponse>({
     key: statsKeys.audience(range), adminFetch, enabled, staleTime: 0,
     refetchInterval: () => 30_000,
     placeholderData: previous => previous,
     request: (fetcher, signal) => adminJson(fetcher, `/audience?sinceMinutes=${range}`, undefined, signal),
   });
-  // Range is part of both cache keys. Keep a range-independent last success so
-  // a first-request failure for a newly selected range cannot blank the charts
-  // after TanStack releases the previous range's placeholder.
+  // Range is part of both cache keys, so keep a range-independent last success:
+  // a first failure on a new range would otherwise blank the charts.
   const [lastListeners, setLastListeners] = useState<ListenersResponse | null>(null);
   const [lastAudience, setLastAudience] = useState<AudienceResponse | null>(null);
   useEffect(() => {
@@ -564,9 +687,8 @@ export default function StatsPanel() {
     if (audienceQuery.data) setLastAudience(audienceQuery.data);
   }, [audienceQuery.data]);
 
-  // /listeners/connections — 30s, range-independent ("connected right now").
-  // A 502 is stored as an error rather than dropped, so the card can say "live
-  // detail unavailable" instead of silently blanking.
+  // /listeners/connections — 30s, range-independent. A 502 is stored as an
+  // error, not dropped, so the card can say "live detail unavailable".
   const connectionsQuery = useAdminQuery<ConnectionsResponse>({
     key: statsKeys.connections(), adminFetch, enabled, staleTime: 0,
     refetchInterval: () => 30_000,
@@ -585,8 +707,8 @@ export default function StatsPanel() {
     },
   });
 
-  // /system — per-container CPU/memory, 30s (it samples the Docker stats stream
-  // for ~1s per container). Soft-fails; range-independent.
+  // /system — per-container CPU/memory, 30s (~1s per container to sample).
+  // Soft-fails; range-independent.
   const systemQuery = useAdminQuery<SystemResponse>({
     key: statsKeys.system(), adminFetch, enabled, staleTime: 0,
     refetchInterval: () => 30_000,
@@ -613,8 +735,7 @@ export default function StatsPanel() {
   const lAvg = counts.length ? counts.reduce((a, b) => a + b, 0) / counts.length : null;
   const rangeLabel = range === '10080' ? '7d' : '24h';
 
-  // Same listener series as the trend chart, so it respects the range toggle.
-  // Local time.
+  // Same series as the trend chart, so it respects the range toggle. Local time.
   const hourBuckets = bucketSamplesByHour(samples);
 
   const audSessions = audience?.sessions ?? null;
@@ -693,9 +814,6 @@ export default function StatsPanel() {
         sub={`where listeners came from · last ${rangeLabel}`}
       >
         <div className="grid gap-0">
-          {/* Rendered independently of the durable beacon rollup below, so it
-              still shows on a fresh boot with zero recorded sessions. No IPs
-              here (unlike the Dash), only device class, counts and durations. */}
           <div className="border-b border-separator-strong p-3.5">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
               <span className="caption">connected now · by device</span>
@@ -801,8 +919,6 @@ export default function StatsPanel() {
               ) : null
             }
           >
-            {/* Durable per-UTC-day tally, so it shows regardless of the
-                since-boot call count above, and only when a cap is set. */}
             {llm.budget?.enabled && (
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-separator-strong p-3.5">
                 <span className="caption">
@@ -881,6 +997,78 @@ export default function StatsPanel() {
                 </div>
               </div>
             )}
+          </Card>
+
+          <Card
+            title="LLM context windows"
+            sub="reported input tokens · since controller start"
+            right={(() => {
+              // Lead with the route the station is actually running.
+              const active = data?.trackSelection === 'shortlist'
+                ? { label: 'shortlist', window: llm.contextWindows?.shortlist }
+                : { label: 'Agentic', window: llm.contextWindows?.agenticPicker };
+              return active.window?.suggestedTokens ? (
+                <Pill tone="accent">
+                  {active.label} recommends {fmtTokens(active.window.suggestedTokens)}
+                </Pill>
+              ) : null;
+            })()}
+          >
+            {(() => {
+              const context = llm.contextWindows;
+              const shortlist = context?.shortlist;
+              const agenticPicker = context?.agenticPicker;
+              const rows = context?.byKind ?? [];
+              return (
+                <div className="grid gap-0">
+                  <MetricStrip>
+                    <StatCell label="Shortlist num_ctx" accent
+                      value={fmtTokens(shortlist?.suggestedTokens)}
+                      sub={shortlist?.suggestedTokens
+                        ? `${fmtTokens(shortlist.peakInputTokens)} peak prompt${shortlist.peakKind ? ` · ${shortlist.peakKind.replace(/^sdk\./, '')}` : ''}`
+                        : 'waiting for shortlist usage'} />
+                    <StatCell label="Agentic Picker num_ctx" accent
+                      value={fmtTokens(agenticPicker?.suggestedTokens)}
+                      sub={agenticPicker?.suggestedTokens
+                        ? `${fmtTokens(agenticPicker.peakInputTokens)} peak prompt${agenticPicker.peakKind ? ` · ${agenticPicker.peakKind.replace(/^sdk\./, '')}` : ''}`
+                        : 'waiting for Agentic usage'} />
+                    <StatCell label="Headroom"
+                      value={agenticPicker?.headroomPct != null ? `${agenticPicker.headroomPct}%` : shortlist?.headroomPct != null ? `${shortlist.headroomPct}%` : '—'}
+                      sub={agenticPicker?.responseReserveTokens != null || shortlist?.responseReserveTokens != null
+                        ? `${fmtTokens(agenticPicker?.responseReserveTokens ?? shortlist?.responseReserveTokens)} response reserve`
+                        : 'applied once samples arrive'} />
+                    <StatCell label="Agentic samples" value={fmtInt(agenticPicker?.samples)} last
+                      sub="successful calls with input usage" />
+                  </MetricStrip>
+                  <div className="border-t border-separator-soft p-3.5">
+                    <p className="field-hint mb-3 max-w-[760px]">
+                      Ollama&apos;s num_ctx is one setting for every call, so each route&apos;s figure must hold its own
+                      picker prompts and every other LLM function running beside it (links, segments, requests). Agentic
+                      counts its largest individual model step rather than the whole tool loop. Both add headroom and a
+                      response reserve, then round up for a server context setting. The peak names the function that set it.
+                    </p>
+                    <Table<ContextWindowRow>
+                      empty="No LLM calls recorded yet"
+                      rows={rows}
+                      cols={[
+                        { key: 'kind', label: 'Function', render: r => r.kind.replace(/^sdk\./, '') },
+                        { key: 'calls', label: 'Calls', align: 'right',
+                          render: r => <span className="mono-num">{r.calls}</span> },
+                        { key: 'samples', label: 'Usage', align: 'right',
+                          render: r => <span className="mono-num">{r.samples}/{r.calls}</span> },
+                        { key: 'averageInputTokens', label: 'Avg context', align: 'right',
+                          render: r => <span className="mono-num">{fmtTokens(r.averageInputTokens)}</span> },
+                        { key: 'peakInputTokens', label: 'Peak', align: 'right',
+                          render: r => <span className="mono-num">{fmtTokens(r.peakInputTokens)}</span> },
+                      ]}
+                    />
+                    {agenticPicker?.suggestedTokens == null && shortlist?.suggestedTokens == null && (
+                      <p className="field-hint mt-3 italic">{agenticPicker?.message || shortlist?.message || 'Waiting for context-window evidence.'}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </Card>
 
           <Card title="Voice / TTS usage" sub={`last ${tts.window} spoken segments`}>
@@ -1024,6 +1212,10 @@ export default function StatsPanel() {
               </ScrollBox>
             )}
           </Card>
+
+          {/* Absent (undefined) means a controller too old to keep the record:
+              no card rather than a misleading "unavailable". */}
+          {data.transitions !== undefined && <TransitionsCard t={data.transitions} />}
         </>
       )}
 

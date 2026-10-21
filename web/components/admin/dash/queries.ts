@@ -2,15 +2,17 @@ import type { QueryClient } from '@tanstack/react-query';
 import type { SessionTurn } from '../../../lib/types';
 import { AdminResponseError, adminJson, type AdminFetch } from '../../../lib/admin-query';
 import type { ScheduleOverride } from '../../../lib/schemas.generated';
-import type {
-  ActResponse,
-  ConnectionsState,
-  DashStatus,
-  HealthStats,
-  QueueState,
-  RequestEntry,
+import {
+  UNKNOWN_TRUSTED_PROXIES,
+  type ActResponse,
+  type ConnectionsState,
+  type DashStatus,
+  type HealthStats,
+  type QueueState,
+  type RequestEntry,
 } from './types';
 import { scheduleKeys, type ScheduleLiveData } from '../schedule/queries';
+import { toConnectionsState } from './connections';
 
 export const dashKeys = {
   all: ['dash'] as const,
@@ -20,6 +22,9 @@ export const dashKeys = {
   requests: () => ['dash', 'requests'] as const,
   suggestions: () => ['dash', 'suggestions'] as const,
   takeover: () => ['dash', 'takeover'] as const,
+  // Nested under takeover() on purpose: a pin write invalidates that prefix,
+  // and the preview it invalidates alongside is stale the moment one lands.
+  takeoverWindow: () => ['dash', 'takeover', 'window'] as const,
   navidrome: () => ['dash', 'banner', 'navidrome'] as const,
   musicStarved: () => ['dash', 'banner', 'music-starved'] as const,
 };
@@ -45,11 +50,32 @@ export async function fetchDashStatus(fetcher: AdminFetch, signal: AbortSignal):
   return { ...nowPlaying, queue: state ?? {}, sessionMessages: session?.messages ?? [] };
 }
 
+/**
+ * Drop a queued row from the cached status ahead of its DELETE; the poll
+ * confirms. An in-flight status read is cancelled first so it cannot land over
+ * the patch with the row still in it. The write is stamped like a fresh read
+ * but carries everything else the cache held, now-playing included, so never
+ * judge what is on air from this cache after a refetch: never-play's skip
+ * reads the fetch's own answer instead (`refetchOnAirId`, #2018).
+ */
+export async function removeQueuedRow(client: QueryClient, id: string): Promise<void> {
+  await client.cancelQueries({ queryKey: dashKeys.status(), exact: true }, { silent: true });
+  client.setQueryData<DashStatus>(dashKeys.status(), current => current
+    ? {
+        ...current,
+        queue: {
+          ...(current.queue || {}),
+          upcoming: (current.queue?.upcoming || []).filter(item => item.subsonic_id !== id),
+        },
+      }
+    : current);
+}
+
 export async function fetchConnections(fetcher: AdminFetch, signal: AbortSignal): Promise<ConnectionsState> {
   const body = await adminJson<Partial<ConnectionsState>>(
     fetcher, '/listeners/connections', undefined, signal,
   );
-  return { count: body?.count ?? 0, connections: body?.connections ?? [] };
+  return toConnectionsState(body, UNKNOWN_TRUSTED_PROXIES);
 }
 
 export function fetchHealthStats(fetcher: AdminFetch, signal: AbortSignal): Promise<HealthStats> {
@@ -81,7 +107,9 @@ export async function runDashAction(
     body: JSON.stringify(body || {}),
   });
   const result = await response.json().catch(() => ({})) as ActResponse;
-  if (!response.ok) throw new Error(result.error || `failed (${response.status})`);
+  // Same message as ever; the status rides along so a caller can tell an
+  // answer (the targeted skip's 409) from a failure.
+  if (!response.ok) throw new AdminResponseError(result.error || `failed (${response.status})`, response.status, result);
   return result;
 }
 
@@ -93,6 +121,26 @@ export interface TakeoverShow {
 export interface TakeoverData {
   shows: TakeoverShow[];
   override: ScheduleOverride | null;
+}
+
+/**
+ * What `until: 'schedule-change'` would resolve to right now (#1601) — the
+ * concrete end time the dialog shows before the operator commits.
+ *
+ * Advisory: POST /schedule/override resolves it again at its own `startedAt`,
+ * so this is what the pin would be, never what it is. `source` says which rule
+ * decided — the grid's own change (however near it is: there is no floor on
+ * this path), or the ceiling, under either of its two meanings.
+ */
+export interface TakeoverWindow {
+  expiresAt: number;
+  minutes: number;
+  source: 'schedule' | 'maximum' | 'ceiling';
+  nextChangeAt: number | null;
+}
+
+export function fetchTakeoverWindow(fetcher: AdminFetch, signal: AbortSignal): Promise<TakeoverWindow> {
+  return adminJson(fetcher, '/schedule/next-change', undefined, signal);
 }
 
 /** One `/schedule/override` write owns both route-specific views of the pin. */

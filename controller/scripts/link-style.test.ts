@@ -2,28 +2,25 @@
 // matter-of-fact station whose links are exactly "This is <artist>." or
 // "Next up, <artist>." instead of the ordinary "set it up, name the artist"
 // contract. Covers: persona normalisation (absent/valid/garbage), the
-// settings.announceLinks() helper, the two pure prompt builders that carry a
-// fallback announce contract to the model (dj-agent's buildLinkClause and
-// llm/internal/prompts/scripts.ts's linkPrompt), and announce-line.ts — the
-// module that actually COMPOSES the announcement in code, since a model can
+// settings.announceLinks() helper, the isolated link writer's prompt, and
+// announce-line.ts, which composes the announcement in code, since a model can
 // neither hold a fixed string reliably nor alternate with a line it is never
 // shown. The compose is PURE: it alternates against the link that last AIRED
 // (handed in by the caller), refuses the artists an English frame cannot carry,
 // and pins the /dj/segment button's link to the only form true of a track
 // already playing.
 //
-// Run: npx tsx scripts/link-style.test.ts (auto-discovered by npm test).
+// Run: `npm test -- link-style`.
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { createTempDir } from './test-utils/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-process.env.STATE_DIR = mkdtempSync(join(tmpdir(), 'subwave-link-style-'));
+process.env.STATE_DIR = createTempDir(join(tmpdir(), 'subwave-link-style-'));
 
 const { normalizePersona } = await import('../src/settings/normalize.js');
 const { announceLinks } = await import('../src/settings/persona.js');
-const { buildLinkClause } = await import('../src/broadcast/dj-agent/link-clause.js');
 const { linkPrompt, generateLink } = await import('../src/llm/internal/prompts/scripts.js');
 const { announceLine, nextAnnounceForm } = await import('../src/broadcast/announce-line.js');
 const { queue } = await import('../src/broadcast/queue.js');
@@ -64,66 +61,15 @@ test('announceLinks is true only when linkStyle is exactly "announce"', () => {
   assert.equal(announceLinks(undefined), false);
 });
 
-// ── dj-agent's per-pick event clause (buildLinkClause) ───────────────────────
+// ── scripts.ts's isolated writer prompt ─────────────────────────────────────
 
-test('announce link clause carries the fixed two-form contract, not the variety instructions or the alternate instruction', () => {
-  const clause = buildLinkClause({ djMode: true, announce: true, angle: null, recentOpeners: [] });
-  assert.match(clause, /This is/);
-  assert.match(clause, /Next up,/);
-  assert.doesNotMatch(clause, /Approach for this link/);
-  assert.doesNotMatch(clause, /start this one differently/);
-  // The station composes and alternates the final line (announce-line.ts) —
-  // the model is never asked to alternate with a line it can't see.
-  assert.doesNotMatch(clause, /[Aa]lternate/);
-});
-
-test('natural link clause keeps the pre-existing variety contract', () => {
-  const clause = buildLinkClause({
-    djMode: false,
-    announce: false,
-    angle: 'lead with one specific image from the track itself.',
-    recentOpeners: [],
-  });
-  assert.match(clause, /Approach for this link/);
-});
-
-test('natural link clause output is unchanged versus the pre-extraction template', () => {
-  const angle = 'lead with one specific image from the track itself.';
-  const withoutDjMode = buildLinkClause({ djMode: false, announce: false, angle, recentOpeners: [] });
-  assert.equal(
-    withoutDjMode,
-    ` Also write the "say" link — it airs as your pick starts.`
-      + ` Approach for this link: ${angle} Vary your first words — don't default to "here's", "this is", or "coming up".`,
-  );
-
-  const withDjMode = buildLinkClause({ djMode: true, announce: false, angle, recentOpeners: ['Here we go'] });
-  assert.equal(
-    withDjMode,
-    ` Also write the "say" link — it airs as your pick starts. If the track you pick shows an intro_ms, keep the link short enough to finish before then, so you land just as the vocals come in.`
-      + ` Approach for this link: ${angle} Vary your first words — don't default to "here's", "this is", or "coming up".`
-      + ` You opened recent lines with "Here we go…" — start this one differently.`,
-  );
-});
-
-// ── scripts.ts's pure prompt builder (linkPrompt) ────────────────────────────
-
-test('announce link prompt names the artist in the fixed two-form contract', () => {
+test('the isolated writer prompt never carries the announce-model contract', () => {
   const prompt = linkPrompt({
-    announce: true,
-    current: { artist: 'Marvin Gaye' },
-    teaseClause: ' Name the artist or capture the feel so listeners know what they\'re hearing.',
-    patterClause: '',
-    budget: null,
-    lengthPhraseText: 'one or two sentences',
-    clockClause: ' Never state the clock time.',
-    feelClause: ' A feel note...',
+    current: { title: 'Unknown', artist: 'Marvin Gaye' },
+    context: null,
   });
-  assert.match(prompt, /This is Marvin Gaye\./);
-  assert.match(prompt, /Next up, Marvin Gaye\./);
-  assert.doesNotMatch(prompt, /Vary how you open/);
-  assert.doesNotMatch(prompt, /feel note/);
-  assert.doesNotMatch(prompt, /Never state the clock time/);
-  assert.doesNotMatch(prompt, /[Aa]lternate/);
+  assert.match(prompt, /Verified Facts:/);
+  assert.doesNotMatch(prompt, /This is Marvin Gaye\.|Next up, Marvin Gaye\./);
 });
 
 // ── announce-line.ts — the station composes and alternates, the model never does ──
@@ -261,38 +207,22 @@ test('generateLink in announce mode drops the link when the track has no artist'
   }
 });
 
-test('the announce prompt never carries a placeholder in place of an artist name', () => {
+test('the isolated writer prompt never carries an announce placeholder', () => {
   const prompt = linkPrompt({
-    announce: true,
-    current: { artist: '' },
-    teaseClause: '', patterClause: '', budget: null,
-    lengthPhraseText: 'one or two sentences', clockClause: '', feelClause: '',
+    current: { title: 'Untitled', artist: '' },
+    context: null,
   });
   assert.doesNotMatch(prompt, /<artist>/);
-  // With no name to announce it falls back to the well-formed natural ask
-  // rather than a two-form contract it cannot fill.
-  assert.match(prompt, /Write a short DJ link/);
+  assert.match(prompt, /Task: Give a brief spoken introduction/);
 });
 
-test('natural link prompt is unchanged versus the pre-extraction template', () => {
+test('natural link prompt exposes only the bounded verified-facts packet', () => {
   const prompt = linkPrompt({
-    announce: false,
-    current: { artist: 'Marvin Gaye' },
-    teaseClause: ' Name the artist or capture the feel so listeners know what they\'re hearing.',
-    patterClause: '',
-    budget: null,
-    lengthPhraseText: 'one or two sentences',
-    clockClause: ' Never state the clock time.',
-    feelClause: '',
+    current: { title: 'Unknown', artist: 'Marvin Gaye' },
+    context: { time: { vibe: 'private selection steer' } },
   });
-  assert.equal(
-    prompt,
-    `Write a short DJ link to carry into the track now starting — set it up, capture its feel, weave in the moment.`
-      + ` Name the artist or capture the feel so listeners know what they're hearing. one or two sentences, conversational.`
-      + ` Vary how you open — don't default to "here's", "this is", "coming up", or "that was"; find a different way in each time.`
-      + ` Keep it forward-looking: don't back-announce, recap, or name the track that just played — focus on what's playing now.`
-      + ` Never state the clock time.`,
-  );
+  assert.match(prompt, /Track on air:\n- Unknown by Marvin Gaye/);
+  assert.doesNotMatch(prompt, /private selection steer/);
 });
 
 // ── the air-truth anchor the alternation reads ───────────────────────────────
@@ -314,27 +244,4 @@ test('getLastLinkText returns the most recently aired link and ignores other kin
   assert.equal(queue.getLastLinkText(), 'Next up, Kim Weston.');
   assert.equal(nextAnnounceForm(queue.getLastLinkText()), 'this-is');
   (queue as any).djLog = [];
-});
-
-// ── the announce contract follows the persona who SPEAKS the line ────────────
-
-// The link is pinned to session.onAirPersona() at enqueue, and inside the
-// handoff look-ahead that disagrees with the wall-clock getEffectivePersona()
-// — which is what a bare announceLinks() resolves to. Written the incoming
-// DJ's line under the outgoing DJ's link contract. Source-level because the
-// two personas only diverge inside a live look-ahead window.
-test('every announce-mode call site names the persona it resolves against', async () => {
-  const { readFileSync } = await import('node:fs');
-  for (const file of [
-    '../src/broadcast/dj-agent.ts',
-    '../src/broadcast/dj-agent/schemas.ts',
-  ]) {
-    const src = readFileSync(new URL(file, import.meta.url), 'utf8');
-    assert.doesNotMatch(
-      src,
-      /announceLinks\(\s*\)/,
-      `${file} calls announceLinks() with no persona — it must pass session.onAirPersona()`,
-    );
-    assert.match(src, /announceLinks\(\s*(?:link)?[Ss]peaker|announceLinks\(session\.onAirPersona\(\)\)/);
-  }
 });

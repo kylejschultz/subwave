@@ -16,14 +16,16 @@ import { EmbeddingProviderSelector } from '../embedding/EmbeddingProviderSelecto
 import { ModelCombobox } from '../llm/ModelCombobox';
 import { LLM_ENV_VARS, llmProviderLabel } from '../llm/providerMeta';
 import { cn } from '../../../lib/cn';
+import { HeaderRowsEditor } from './LlmSection';
+import { effectiveCompatMode } from './compat-mode';
 import {
   SectionHeader, SaveBar, KeyStatus,
+  headerMap,
   type SectionProps,
 } from './shared';
 
-// The #1 trip-up is typing an HF/locca repo id like
-// "nomic-ai/nomic-embed-text-v1.5-GGUF" as an Ollama tag, which 404s — Ollama
-// wants the short tag. dim is shown so an already-tagged library can be matched.
+// Ollama wants the short tag, not an HF/locca repo id (those 404). dim is
+// shown so an already-tagged library can be matched.
 const EMBED_MODEL_SUGGESTIONS: Record<string, { id: string; dim: number }[]> = {
   ollama: [
     { id: 'nomic-embed-text', dim: 768 },
@@ -87,6 +89,7 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
         provider: e.provider,
         model: e.model,
         providerBaseUrls: e.providerBaseUrls,
+        headers: headerMap(e.headers),
         ollamaUrl: e.ollamaUrl,
         seedCount: parseInt(e.seedCount, 10) || 0,
         knnNeighbours: parseInt(e.knnNeighbours, 10) || 10,
@@ -124,21 +127,20 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
 
   const savedEmbedding = data.values?.embedding || {};
   const llmProvider = data.values?.llm?.provider || 'ollama';
+  // The chat connection's mode as in force, `auto` resolved to its detection.
+  const llmCompatMode = effectiveCompatMode(form.llm.compatibleMode, data.llm?.compatDetection?.primary);
   const effectiveProvider = e.provider || llmProvider;
   const embedSuggestions = EMBED_MODEL_SUGGESTIONS[effectiveProvider] ?? [];
 
-  // The embedding-capable subset, NOT the full LLM list: chat-only providers
-  // (deepseek, gateway) have no embeddings endpoint (#493); OpenRouter shipped one
-  // so it is back in (#522); Anthropic has no embedding API at all.
+  // Embedding-capable subset, not the full LLM list: deepseek, gateway and
+  // anthropic have no embeddings endpoint (#493, #522).
   const embedProviders = data.embedding?.providers ||
     ['ollama', 'openai-compatible', 'locca', 'openrouter', 'openai', 'google', 'requesty'];
-  // Keep a stale explicit choice (a chat-only provider saved before this list
-  // shrank) visible so the Select isn't blank and the warning below makes sense.
+  // Keep a stale explicit choice visible so the Select isn't blank.
   const providers = e.provider && !embedProviders.includes(e.provider)
     ? [e.provider, ...embedProviders]
     : embedProviders;
-  // False when "Follow LLM provider" resolves to a chat-only LLM, or a stale config
-  // still names one. Drives the warning below.
+  // False when the effective provider is chat-only; drives the warning below.
   const canEmbed = embedProviders.includes(effectiveProvider);
 
   // Probe the endpoint up front rather than failing mid-run (#405 follow-up).
@@ -153,9 +155,8 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
 
   const embedKeyVar = LLM_ENV_VARS[effectiveProvider];
   const embedKeySet = !!(embedKeyVar && data.env?.[embedKeyVar]);
-  // Embeddings reuse the DJ provider's key, so "present" means that provider's env
-  // var OR the optional override. Keying off EMBEDDING_API_KEY alone would cry
-  // "missing" for a provider whose key is already set for the DJ.
+  // Embeddings reuse the DJ provider's key, so "present" means that provider's
+  // env var OR the optional EMBEDDING_API_KEY override.
   const embedKeyPresent = embedKeySet || !!data.env?.['EMBEDDING_API_KEY'];
 
   // `||` (not `??`) so a field cleared in the form ('' entry) falls through to
@@ -183,12 +184,13 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
   // POST body, not query params — the unsaved bearer token must never ride a
   // URL that reverse-proxy access logs capture.
   const probeBody = () => {
-    const b: Record<string, string> = {};
+    const b: Record<string, string | Record<string, string>> = {};
     if (e.provider) b.provider = e.provider;
     if (e.model) b.model = e.model;
     if (embedBaseUrl) b.baseUrl = embedBaseUrl;
     if (e.ollamaUrl) b.ollamaUrl = e.ollamaUrl;
     if (compatEmbedKeyInput.trim()) b.apiKey = compatEmbedKeyInput.trim();
+    b.headers = headerMap(e.headers);
     return b;
   };
 
@@ -335,9 +337,6 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
 
       <Card title="Embedding server" sub="where embeddings come from">
         <div className="grid gap-[18px]">
-          {/* Provider/model/dim resolve to a working default even with both fields
-              blank, so say so rather than looking unconfigured. Hidden when the
-              effective provider can't embed — the warning below covers that. */}
           {canEmbed && effectiveModel && (
             <div className="flex items-start gap-x-2 border border-[color-mix(in_oklab,var(--accent)_30%,transparent)] bg-[var(--accent-soft)] p-3 text-[11px] leading-[1.5] text-ink">
               <span className="flex-none text-[12px] leading-[1.5] text-[var(--accent)]">✓</span>
@@ -375,8 +374,6 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
               Anthropic has no first-party embedding API; if your LLM is Anthropic,
               pick OpenAI here (needs <code>OPENAI_API_KEY</code>).
             </div>
-            {/* The banner above already states the resolved provider/model/dim, so
-                only the already-embedded-with-a-different-model warning goes here. */}
             {embeddedMeta && embeddedMeta.model !== effectiveModel && (
               <div className="field-hint">
                 Your library is embedded with{' '}
@@ -491,9 +488,9 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
                 className="max-w-[360px]"
               />
               <div className="field-hint">
-                Embeddings need a <strong>dedicated</strong> server: one
-                llama.cpp / locca process can&apos;t serve both chat and
-                embeddings.{' '}
+                {effectiveProvider === 'openai-compatible' && llmCompatMode === 'hosted'
+                  ? <>Leave blank to use the chat service&apos;s embedding endpoint. For Azure, enter a different resource URL ending in <code>/openai/v1</code> only when embeddings live on another resource. Enter the embedding deployment name above. </>
+                  : <>Embeddings need a <strong>dedicated</strong> server when a local chat server cannot embed. </>}
                 {effectiveProvider === 'locca' ? (
                   <>
                     Leave blank to use the locca embed server on its default port
@@ -501,7 +498,7 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
                     with <code>locca embed nomic</code>. Override only for a
                     non-default port or remote host.
                   </>
-                ) : (
+                ) : llmCompatMode === 'hosted' ? null : (
                   <>
                     Leave blank only if this server itself does embeddings;
                     otherwise run a separate embedding server (
@@ -539,6 +536,19 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
             </div>
           )}
 
+          {effectiveProvider === 'openai-compatible' && (
+            <div className="field">
+              <Label>Embedding request headers</Label>
+              <HeaderRowsEditor idPrefix="embedding-header" rows={e.headers}
+                onChange={rows => setForm(f => ({ ...f, embedding: { ...f.embedding, headers: rows } }))} />
+              <div className="field-hint">
+                Leave empty to use the chat connection&apos;s headers when embeddings
+                use the same provider and server. For a separate Azure embedding resource,
+                add its <code>api-key</code> here. Values are hidden after saving.
+              </div>
+            </div>
+          )}
+
           {effectiveProvider === 'ollama' && (
             <div className="field">
               <Label>Embedding server URL</Label>
@@ -558,9 +568,6 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
             </div>
           )}
 
-          {/* embedKeyVar is undefined for ollama / openai-compatible / locca, which
-              need no conventional key. The override only matters when embeddings run
-              on a different provider than the DJ. */}
           {embedKeyVar && (
             <>
               <div className="field">
@@ -617,8 +624,6 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
         </div>
       </Card>
 
-      {/* No run button: the bulk tagger is launched from the Library page's
-          "Start tagging" flow. */}
 
       <Advanced note="seed count, propagation thresholds and enrichment">
       <Card title="Seed phase" sub="how many tracks to LLM-tag">
@@ -852,9 +857,9 @@ export function LibrarySection({ data, form, setForm, busy, saveSettings, adminF
         saveLabel="Save library tagger"
         errors={fieldErrors}
         ownedKeys={['embedding', 'audio']}
-        // Both key boxes are component-local — the panel diffs FormState and
-        // cannot see them, so a pasted key alone would leave the section
-        // "clean" and unmount the very button that saves it.
+        // Both key boxes are component-local, so the panel's FormState diff
+        // can't see them; without this a pasted key looks clean and the save
+        // button unmounts.
         dirty={!!(embeddingKeyInput.trim() || compatEmbedKeyInput.trim())}
       />
     </>

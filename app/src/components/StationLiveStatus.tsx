@@ -1,8 +1,3 @@
-// Per-station live indicator for the Discover list, mirroring the web
-// StationCard probe: fetch the station's /api/now-playing and show an ON AIR dot
-// + current track when online, or a muted "offline" otherwise. Each row probes
-// independently and lazily; a dead station just reads offline (failures swallowed).
-
 import { useEffect, useState } from 'react';
 import { Text, View } from 'react-native';
 import LiveDot from '@/components/LiveDot';
